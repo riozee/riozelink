@@ -1,0 +1,330 @@
+/**
+ * The AI gateway.
+ *
+ * Two providers behind one streaming call. Ollama speaks its own NDJSON dialect and needs no key;
+ * an OpenAI-compatible endpoint speaks SSE and uses one. The daemon holds the key so the browser
+ * never has to, and the client only ever sees the masked form.
+ *
+ * A stream is identified by a client-chosen `streamId`, which is what makes cancel possible and
+ * what keeps two chats in two windows from mixing their chunks.
+ */
+import type { HostConfig } from './config.ts';
+import { DEFAULT_ENDPOINTS, DEFAULT_MODELS } from './config.ts';
+import { HostError, requireString } from './errors.ts';
+import type {
+	AiChatRequest,
+	AiMessage,
+	AiProvider,
+	AiStatusReply,
+	RpcErrorInfo
+} from './protocol.ts';
+import { maskKey, truncate } from './util.ts';
+
+export interface AiHost {
+	config: HostConfig;
+	save(): Promise<void>;
+}
+
+export interface AiStreamSink {
+	chunk(streamId: string, delta: string): void;
+	end(streamId: string, text: string): void;
+	error(streamId: string, error: RpcErrorInfo): void;
+}
+
+const PROBE_TIMEOUT_MS = 2500;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === 'object' && value !== null;
+}
+
+export class AiService {
+	private readonly controllers = new Map<string, AbortController>();
+
+	constructor(private readonly host: AiHost) {}
+
+	async status(): Promise<AiStatusReply> {
+		const { provider, endpoint, model, apiKey } = this.host.config.ai;
+		const probe = await this.probe(provider, endpoint, apiKey);
+		return {
+			provider,
+			endpoint,
+			model,
+			keySet: apiKey.length > 0,
+			keyMasked: apiKey ? maskKey(apiKey) : null,
+			available: probe.ok,
+			models: probe.models
+		};
+	}
+
+	async setConfig(patch: { provider?: unknown; endpoint?: unknown; model?: unknown }): Promise<AiStatusReply> {
+		const ai = this.host.config.ai;
+		if (patch.provider === 'ollama' || patch.provider === 'openai') {
+			if (patch.provider !== ai.provider) {
+				ai.provider = patch.provider;
+				// A provider switch brings its own home address and a sensible default model,
+				// unless the caller is setting them in the same call.
+				ai.endpoint = DEFAULT_ENDPOINTS[patch.provider];
+				ai.model = DEFAULT_MODELS[patch.provider];
+			}
+		}
+		if (typeof patch.endpoint === 'string') {
+			const endpoint = patch.endpoint.trim().replace(/\/+$/, '');
+			if (!/^https?:\/\/[^\s]+$/.test(endpoint)) {
+				throw new HostError('the endpoint must be an http(s) URL', 'invalid');
+			}
+			ai.endpoint = endpoint;
+		}
+		if (typeof patch.model === 'string') {
+			const model = patch.model.trim();
+			if (!model) throw new HostError('the model name cannot be empty', 'invalid');
+			ai.model = model;
+		}
+		await this.host.save();
+		return this.status();
+	}
+
+	async setKey(key: string): Promise<AiStatusReply> {
+		const trimmed = key.trim();
+		if (!trimmed) throw new HostError('the key cannot be empty', 'invalid');
+		this.host.config.ai.apiKey = trimmed;
+		await this.host.save();
+		return this.status();
+	}
+
+	async clearKey(): Promise<AiStatusReply> {
+		this.host.config.ai.apiKey = '';
+		await this.host.save();
+		return this.status();
+	}
+
+	cancel(streamId: string): void {
+		this.controllers.get(streamId)?.abort();
+		this.controllers.delete(streamId);
+	}
+
+	cancelAll(): void {
+		for (const controller of this.controllers.values()) controller.abort();
+		this.controllers.clear();
+	}
+
+	async chat(payload: AiChatRequest, sink: AiStreamSink): Promise<void> {
+		const streamId = requireString(payload.streamId, 'streamId');
+		const messages = this.readMessages(payload.messages);
+		const ai = this.host.config.ai;
+		const controller = new AbortController();
+		this.controllers.set(streamId, controller);
+
+		try {
+			if (ai.provider === 'ollama') {
+				await this.chatOllama(streamId, payload, messages, controller.signal, sink);
+			} else {
+				await this.chatOpenai(streamId, payload, messages, controller.signal, sink);
+			}
+		} catch (error) {
+			if (!controller.signal.aborted) sink.error(streamId, this.toInfo(error));
+		} finally {
+			this.controllers.delete(streamId);
+		}
+	}
+
+	private readMessages(value: unknown): AiMessage[] {
+		if (!Array.isArray(value) || value.length === 0) {
+			throw new HostError('a chat needs at least one message', 'invalid');
+		}
+		return value.map((entry, index) => {
+			if (!isRecord(entry) || typeof entry.content !== 'string') {
+				throw new HostError(`message ${index} has no content`, 'invalid');
+			}
+			const role = entry.role === 'system' || entry.role === 'assistant' ? entry.role : 'user';
+			return { role, content: entry.content as string };
+		});
+	}
+
+	private async chatOllama(
+		streamId: string,
+		payload: AiChatRequest,
+		messages: AiMessage[],
+		signal: AbortSignal,
+		sink: AiStreamSink
+	): Promise<void> {
+		const ai = this.host.config.ai;
+		const response = await this.fetchJson(
+			`${ai.endpoint}/api/chat`,
+			{
+				model: payload.model ?? ai.model,
+				messages,
+				stream: true,
+				...(typeof payload.temperature === 'number' ? { options: { temperature: payload.temperature } } : {})
+			},
+			undefined,
+			signal
+		);
+		let text = '';
+		await this.readLines(response, signal, (line) => {
+			const parsed = this.parseJsonLine(line);
+			if (!parsed) return;
+			if (typeof parsed.error === 'string') throw new HostError(`Ollama: ${parsed.error}`, 'io');
+			const message = isRecord(parsed.message) ? parsed.message : null;
+			const delta = message && typeof message.content === 'string' ? message.content : '';
+			if (delta) {
+				text += delta;
+				sink.chunk(streamId, delta);
+			}
+		});
+		sink.end(streamId, text);
+	}
+
+	private async chatOpenai(
+		streamId: string,
+		payload: AiChatRequest,
+		messages: AiMessage[],
+		signal: AbortSignal,
+		sink: AiStreamSink
+	): Promise<void> {
+		const ai = this.host.config.ai;
+		const response = await this.fetchJson(
+			`${ai.endpoint}/v1/chat/completions`,
+			{
+				model: payload.model ?? ai.model,
+				messages,
+				stream: true,
+				...(typeof payload.temperature === 'number' ? { temperature: payload.temperature } : {})
+			},
+			ai.apiKey || undefined,
+			signal
+		);
+		let text = '';
+		await this.readLines(response, signal, (line) => {
+			if (!line.startsWith('data:')) return;
+			const data = line.slice(5).trim();
+			if (!data || data === '[DONE]') return;
+			const parsed = this.parseJsonLine(data);
+			if (!parsed) return;
+			if (isRecord(parsed.error)) {
+				const message = typeof parsed.error.message === 'string' ? parsed.error.message : 'request failed';
+				throw new HostError(`the endpoint said: ${truncate(message, 300)}`, 'io');
+			}
+			const choices = Array.isArray(parsed.choices) ? parsed.choices : [];
+			const first = choices[0];
+			const delta = isRecord(first) && isRecord(first.delta) && typeof first.delta.content === 'string'
+				? first.delta.content
+				: '';
+			if (delta) {
+				text += delta;
+				sink.chunk(streamId, delta);
+			}
+		});
+		sink.end(streamId, text);
+	}
+
+	private async fetchJson(
+		url: string,
+		body: unknown,
+		apiKey: string | undefined,
+		signal: AbortSignal
+	): Promise<Response> {
+		let response: Response;
+		try {
+			response = await fetch(url, {
+				method: 'POST',
+				headers: {
+					'content-type': 'application/json',
+					...(apiKey ? { authorization: `Bearer ${apiKey}` } : {})
+				},
+				body: JSON.stringify(body),
+				signal
+			});
+		} catch (error) {
+			const cause = (error as Error & { cause?: NodeJS.ErrnoException }).cause;
+			if (cause?.code === 'ECONNREFUSED') {
+				throw new HostError(`nothing is listening at ${url}`, 'offline');
+			}
+			throw new HostError(`could not reach ${url}: ${(error as Error).message}`, 'offline');
+		}
+		if (!response.ok) {
+			const detail = await response.text().catch(() => '');
+			throw new HostError(
+				`the model endpoint answered ${response.status}${detail ? `: ${truncate(detail, 300)}` : ''}`,
+				response.status === 401 || response.status === 403 ? 'denied' : 'io'
+			);
+		}
+		if (!response.body) throw new HostError('the endpoint sent no stream', 'io');
+		return response;
+	}
+
+	/** Reads a text stream line by line; each complete line goes to `onLine`. */
+	private async readLines(
+		response: Response,
+		signal: AbortSignal,
+		onLine: (line: string) => void
+	): Promise<void> {
+		const reader = (response.body as ReadableStream<Uint8Array>).getReader();
+		const decoder = new TextDecoder();
+		let buffer = '';
+		for (;;) {
+			if (signal.aborted) throw new HostError('cancelled', 'unknown');
+			const { done, value } = await reader.read();
+			if (done) break;
+			buffer += decoder.decode(value, { stream: true });
+			let index = buffer.indexOf('\n');
+			while (index >= 0) {
+				const line = buffer.slice(0, index).trim();
+				buffer = buffer.slice(index + 1);
+				if (line) onLine(line);
+				index = buffer.indexOf('\n');
+			}
+		}
+		const tail = buffer.trim();
+		if (tail) onLine(tail);
+	}
+
+	private parseJsonLine(line: string): Record<string, unknown> | null {
+		try {
+			const parsed = JSON.parse(line) as unknown;
+			return isRecord(parsed) ? parsed : null;
+		} catch {
+			return null;
+		}
+	}
+
+	private async probe(
+		provider: AiProvider,
+		endpoint: string,
+		apiKey: string
+	): Promise<{ ok: boolean; models: string[] }> {
+		try {
+			const url = provider === 'ollama' ? `${endpoint}/api/tags` : `${endpoint}/v1/models`;
+			const response = await fetch(url, {
+				headers: apiKey ? { authorization: `Bearer ${apiKey}` } : {},
+				signal: AbortSignal.timeout(PROBE_TIMEOUT_MS)
+			});
+			if (!response.ok) return { ok: false, models: [] };
+			const body = (await response.json()) as Record<string, unknown>;
+			if (provider === 'ollama') {
+				const models = Array.isArray(body.models) ? body.models : [];
+				return {
+					ok: true,
+					models: models
+						.filter((m): m is Record<string, unknown> => isRecord(m))
+						.map((m) => (typeof m.name === 'string' ? m.name : ''))
+						.filter(Boolean)
+				};
+			}
+			const data = Array.isArray(body.data) ? body.data : [];
+			return {
+				ok: true,
+				models: data
+					.filter((m): m is Record<string, unknown> => isRecord(m))
+					.map((m) => (typeof m.id === 'string' ? m.id : ''))
+					.filter(Boolean)
+			};
+		} catch {
+			return { ok: false, models: [] };
+		}
+	}
+
+	private toInfo(error: unknown): RpcErrorInfo {
+		if (error instanceof HostError) return { code: error.code, message: error.message };
+		return { code: 'unknown', message: error instanceof Error ? error.message : String(error) };
+	}
+}

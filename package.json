@@ -1,0 +1,30 @@
+{
+	"name": "riozelink",
+	"version": "0.1.0",
+	"description": "Bridge RiozeOS to your computer. Mount host folders as drives, reach AnkiConnect and route AI calls through local models or your own API keys, all over an encrypted WebRTC link.",
+	"type": "module",
+	"module": "src/index.ts",
+	"bin": {
+		"riozelink": "src/index.ts"
+	},
+	"license": "MIT",
+	"keywords": ["riozeos", "webrtc", "ollama", "ankiconnect", "local-first"],
+	"scripts": {
+		"dev": "bun src/index.ts",
+		"start": "bun src/index.ts",
+		"check": "tsc --noEmit",
+		"test": "bun test"
+	},
+	"engines": {
+		"bun": ">=1.2.0"
+	},
+	"dependencies": {
+		"werift": "^0.24.4",
+		"ws": "^8.22.0"
+	},
+	"devDependencies": {
+		"@types/bun": "^1.4.2",
+		"@types/ws": "^8.18.1",
+		"typescript": "^7.0.2"
+	}
+}
