@@ -81,7 +81,7 @@ export interface AuthHelloPayload {
 	clientName: string;
 	/** Client public key, SPKI DER, base64. */
 	publicKey: string;
-	/** Random 32 bytes, base64url. The host signs these so the client can pin the host. */
+	/** Random 32 bytes, base64. The host signs these so the client can pin the host. */
 	clientNonce: string;
 	/** The protocol revision the client speaks. */
 	protocol: number;
@@ -97,7 +97,7 @@ export interface AuthHelloReply {
 	fingerprint: string;
 	/** ECDSA signature over the client nonce, so the client can verify it talks to the right host. */
 	signature: string;
-	/** Random 32 bytes, base64url. The client signs these back to prove its key. */
+	/** Random 32 bytes, base64. The client signs these back to prove its key. */
 	hostNonce: string;
 	/** True when this client's key is already in `authorizedClients`. */
 	known: boolean;

@@ -13,9 +13,12 @@ export function randomBytes(size: number): Buffer {
 	return nodeRandomBytes(size);
 }
 
-/** 32 random bytes as base64url, the shape every nonce takes. */
+/**
+ * 32 random bytes as base64. Standard base64, not the URL-safe alphabet: the client decodes
+ * these with `atob`, which knows nothing about `-` and `_`.
+ */
 export function randomNonce(): string {
-	return nodeRandomBytes(32).toString('base64url');
+	return nodeRandomBytes(32).toString('base64');
 }
 
 export function toBase64(data: Uint8Array): string {
