@@ -22,6 +22,8 @@ export interface PeerLinkOptions {
 export interface PeerLink {
 	/** Feeds one incoming frame from the browser. */
 	handleSignal(data: SignalPayload): Promise<void>;
+	/** The `connectionId` of the offer this peer is handling, once one has arrived. */
+	readonly remoteConnectionId: string | undefined;
 	close(reason?: string): void;
 }
 
@@ -39,6 +41,12 @@ export function createPeerLink(options: PeerLinkOptions): PeerLink {
 	/** Candidates gathered before the answer went out, waiting for their turn. */
 	const buffered = [] as SignalPayload[];
 	let answerSent = false;
+	/**
+	 * The `connectionId` the browser offered with, echoed back on the answer and on every
+	 * candidate. Both ends use it to tell one attempt from the next, which is what lets a browser
+	 * that gave up on a lost answer start over without either side confusing the two.
+	 */
+	let remoteConnectionId: string | undefined;
 
 	function closeOnce(reason: string): void {
 		if (closed) return;
@@ -56,7 +64,7 @@ export function createPeerLink(options: PeerLinkOptions): PeerLink {
 		// Gathering's end is not announced. The peerjs library never sends a null candidate, and the
 		// public cloud is particular about payloads, so neither do we.
 		if (!candidate) return;
-		const frame: SignalPayload = candidatePayload(candidate.toJSON());
+		const frame: SignalPayload = candidatePayload(candidate.toJSON(), remoteConnectionId);
 		// The answer has to arrive before any candidate does. Gathering starts while the answer is
 		// still being built, and a browser that is handed a candidate before a remote description
 		// throws it away, so the frames wait here for one beat.
@@ -83,12 +91,17 @@ export function createPeerLink(options: PeerLinkOptions): PeerLink {
 		if (closed) return;
 		try {
 			if (isOfferPayload(data)) {
+				// One offer is answered once. A repeat of the *same* attempt changes nothing here —
+				// the browser re-sends because the answer may have been lost, and the answer it gets
+				// for the first offer is the one that counts. A different `connectionId` is a
+				// different attempt, and the host decides what to do with that (see `host.ts`).
 				if (offered) return;
 				offered = true;
+				remoteConnectionId = data.connectionId;
 				await peer.setRemoteDescription({ type: 'offer', sdp: data.sdp.sdp });
 				const answer = await peer.createAnswer();
 				await peer.setLocalDescription({ type: 'answer', sdp: answer.sdp });
-				options.send(answerPayload(answer.sdp ?? ''));
+				options.send(answerPayload(answer.sdp ?? '', remoteConnectionId));
 				answerSent = true;
 				for (const frame of buffered) options.send(frame);
 				buffered.length = 0;
@@ -109,5 +122,11 @@ export function createPeerLink(options: PeerLinkOptions): PeerLink {
 		}
 	}
 
-	return { handleSignal, close: (reason = 'closed by the host') => closeOnce(reason) };
+	return {
+		handleSignal,
+		get remoteConnectionId(): string | undefined {
+			return remoteConnectionId;
+		},
+		close: (reason = 'closed by the host') => closeOnce(reason)
+	};
 }

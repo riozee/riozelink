@@ -74,6 +74,56 @@ export interface TestEvent {
 	payload: unknown;
 }
 
+/**
+ * Registers, offers, and then ignores everything the host says.
+ *
+ * This is the state a lost answer leaves behind: the host built a peer and answered, the browser
+ * never applied that answer, and the host's peer is now the only thing standing between this
+ * browser and its next attempt. A new attempt has to be able to push past it.
+ */
+export async function offerAndStall(
+	signalUrl: string,
+	targetId: string
+): Promise<{ close(): void }> {
+	const signalId = makeSignalId();
+	const connectionId = `stall-${Math.random().toString(16).slice(2, 10)}`;
+	const socket = new WebSocket(signalSocketUrl(signalUrl, signalId, `${Math.random()}`));
+	const peer = new RTCPeerConnection({ iceAdditionalHostAddresses: ['127.0.0.1'] });
+	peer.createDataChannel('rioze', { ordered: true });
+	await new Promise<void>((resolve, reject) => {
+		const timer = setTimeout(() => reject(new Error('the stalled client never registered')), 8000);
+		socket.onmessage = (event) => {
+			const message = JSON.parse(String(event.data)) as { type?: string };
+			if (message.type !== 'OPEN') return; // Every answer is deliberately dropped.
+			clearTimeout(timer);
+			resolve();
+		};
+	});
+	const description = await peer.createOffer();
+	await peer.setLocalDescription({ type: 'offer', sdp: description.sdp });
+	socket.send(
+		JSON.stringify({
+			type: 'OFFER',
+			dst: targetId,
+			payload: offerPayload(description.sdp ?? '', connectionId)
+		})
+	);
+	return {
+		close: () => {
+			try {
+				void peer.close();
+			} catch {
+				// Already gone.
+			}
+			try {
+				socket.close();
+			} catch {
+				// Already gone.
+			}
+		}
+	};
+}
+
 export class TestClient {
 	static async connect(
 		signalUrl: string,

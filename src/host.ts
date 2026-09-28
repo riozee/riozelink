@@ -29,6 +29,7 @@ import { HostError } from './errors.ts';
 import { loadOrCreateIdentity, type HostIdentity } from './identity.ts';
 import { createPeerLink, type PeerLink } from './peer.ts';
 import {
+	isOfferPayload,
 	linkId,
 	pairId,
 	pairProof,
@@ -253,6 +254,21 @@ export class RiozeLinkHost implements SessionHost {
 	}
 
 	private async handleSignal(entry: HostLink, data: SignalPayload, from: string): Promise<void> {
+		// A browser that lost an answer starts over with a new `connectionId`, and the peer from
+		// the lost attempt is silent on purpose (one offer is answered once). Left alone it would
+		// eat every later attempt until its own ICE gave up, which is how a link can look dead
+		// while both ends believe they are talking. A different connection id means the old peer
+		// has nothing left to say, so it goes.
+		if (
+			entry.peer &&
+			isOfferPayload(data) &&
+			entry.peer.remoteConnectionId !== undefined &&
+			data.connectionId !== entry.peer.remoteConnectionId
+		) {
+			this.log('info', `a new attempt from ${from}; letting the stalled one go`);
+			entry.peer.close('a new attempt arrived');
+			entry.peer = null;
+		}
 		if (!entry.peer) {
 			entry.peer = createPeerLink({
 				iceServers: this.options.iceServers ?? [],

@@ -15,7 +15,7 @@ import type { RTCDataChannel } from 'werift';
 import type { AnkiService } from './anki.ts';
 import type { AiService, AiStreamSink } from './ai.ts';
 import type { HostConfig, ShareRecord } from './config.ts';
-import { HostError, requireString, toErrorInfo } from './errors.ts';
+import { HostError, requireNumber, requireString, toErrorInfo } from './errors.ts';
 import {
 	fingerprintOfPublicKey,
 	importPublicKey,
@@ -25,6 +25,7 @@ import {
 } from './identity.ts';
 import {
 	PROTOCOL_VERSION,
+	WEB_CHUNK,
 	type AiChatRequest,
 	type AuthHelloPayload,
 	type AuthOkPayload,
@@ -33,9 +34,10 @@ import {
 	type RpcWire,
 	type StatusInfoReply
 } from './protocol.ts';
-import { fromBase64, randomId, randomNonce, toBase64, truncate } from './util.ts';
+import { displayPath, fromBase64, randomId, randomNonce, toBase64, truncate } from './util.ts';
 import * as vfsOps from './vfs.ts';
 import type { UploadTable } from './vfs.ts';
+import { WEB_MAX_PAGES, fetchPage, probeFraming, type WebPage } from './web.ts';
 
 export interface SessionHost {
 	readonly config: HostConfig;
@@ -196,6 +198,8 @@ export class ClientSession {
 		switch (subsystem) {
 			case 'vfs':
 				return this.handleVfs(action, payload);
+			case 'web':
+				return this.handleWeb(action, payload);
 			case 'anki':
 				return this.handleAnki(action, payload);
 			case 'ai':
@@ -382,7 +386,75 @@ export class ClientSession {
 				throw new HostError(`unknown vfs action: ${action}`, 'unsupported');
 		}
 	}
+	/* ---------------------------------------------------------------------- web -------- */
 
+	/**
+	 * The pages this session has fetched, newest last. Only four are kept, because a page is
+	 * a few hundred kilobytes and the app only ever reads back the one it just asked for.
+	 */
+	private readonly pages = new Map<string, WebPage>();
+	private pageSeq = 0;
+
+	private async handleWeb(action: string, raw: unknown): Promise<unknown> {
+		const payload = (raw ?? {}) as Record<string, unknown>;
+		switch (action) {
+			case 'fetch': {
+				const asked = requireString(payload.url, 'url');
+				let page: WebPage;
+				try {
+					page = await fetchPage(asked);
+				} catch (error) {
+					this.host.log(
+						'warn',
+						`${this.clientLabel || this.clientName} could not fetch ${asked} (${(error as Error).message})`
+					);
+					throw error;
+				}
+				this.pageSeq += 1;
+				const id = `page-${this.pageSeq.toString(36)}-${Date.now().toString(36)}`;
+				this.pages.set(id, page);
+				for (const oldest of [...this.pages.keys()].slice(0, -WEB_MAX_PAGES)) {
+					this.pages.delete(oldest);
+				}
+				this.host.log(
+					'info',
+					`${this.clientLabel || this.clientName} fetched ${page.url} (${page.html.byteLength} bytes)`
+				);
+				return {
+					id,
+					url: page.url,
+					title: page.title,
+					contentType: page.contentType,
+					size: page.html.byteLength,
+					truncated: page.truncated
+				};
+			}
+			case 'read': {
+				const id = requireString(payload.id, 'id');
+				const page = this.pages.get(id);
+				if (!page) {
+					throw new HostError('that page is no longer held. Fetch it again.', 'not-found');
+				}
+				const offset = Math.max(0, Math.floor(requireNumber(payload.offset, 'offset')));
+				const wanted = Math.max(1, Math.floor(requireNumber(payload.length, 'length')));
+				const size = page.html.byteLength;
+				if (offset >= size) return { data: '', size, done: true };
+				const end = Math.min(offset + wanted, size, offset + WEB_CHUNK);
+				return {
+					data: toBase64(page.html.subarray(offset, end)),
+					size,
+					done: end >= size
+				};
+			}
+			case 'probe': {
+				// Headers only, and no log line: this runs on every load that *might* have been
+				// refused, and a note about each one would drown the log that matters.
+				return await probeFraming(requireString(payload.url, 'url'));
+			}
+			default:
+				throw new HostError(`unknown web action: ${action}`, 'unsupported');
+		}
+	}
 	/* ---------------------------------------------------------------------- anki ------- */
 
 	private async handleAnki(action: string, raw: unknown): Promise<unknown> {

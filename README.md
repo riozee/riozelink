@@ -164,6 +164,28 @@ The **AI** tab has a toggle of its own, off until you turn it on, and then two p
 Setting a key is a write-only affair: the app opens a dialog, sends the key, and shows
 `sk-...1234` from there on. To replace one, use **Set a new key**. To remove one, use **Clear**.
 
+### Reading the web
+
+The Browser in riozeOS can ask the daemon for a page. Most of the web refuses to sit in a frame
+(`X-Frame-Options`, a `frame-ancestors` policy), and the daemon can fetch the page with this
+machine's network and hand back a document that can be shown: one document per request, the
+meta tags that caused the refusal dropped, a `<base>` tag so the page's relative URLs still
+resolve, and a small script that reports link clicks back to the app so following a link keeps
+going through the same route.
+
+The document comes back in 45 KiB chunks over the data channel, the way a file does, and only
+the document — images, stylesheets and scripts keep their real addresses and load straight from
+their own origins. Nothing is written to disk and nothing is cached between sessions; four pages
+are held per session while the tab is open.
+
+There is also a cheaper call, `web:probe`, that reads a page's *headers* and says whether it
+carries framing rules. The Browser uses it to tell a page that loaded quickly apart from a page
+that was refused, since a refused frame and an empty one look identical from inside the browser.
+
+The fetch has no cookie jar. It sends no credentials the site does not hand out publicly, and
+only `http` and `https` URLs are accepted. A page fetched this way cannot sign anyone in, and the
+app says so on screen instead of implying otherwise.
+
 ## The configuration file
 
 `~/.config/riozelink/config.json`, created on first start. It is meant to be edited by hand, and

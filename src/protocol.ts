@@ -17,7 +17,7 @@
 export const PROTOCOL_VERSION = 1;
 
 /** Who a message is for. `auth` runs first; everything else answers once a session is proven. */
-export type RpcSubsystem = 'auth' | 'vfs' | 'anki' | 'ai' | 'status';
+export type RpcSubsystem = 'auth' | 'vfs' | 'web' | 'anki' | 'ai' | 'status';
 
 /**
  * The envelope of a request. A reply carries the same `id` and an `ok` flag. See {@link RpcWire}
@@ -67,6 +67,15 @@ export type RpcWire =
  * advertise, Safari among them. Chunks that fit everywhere beat chunks that are fast on paper.
  */
 export const VFS_CHUNK = 45 * 1024;
+
+/**
+ * How much of one page travels per message.
+ *
+ * The same 45 KiB as a file chunk, and for the same reason: a fetched page rides the same
+ * DataChannel and has to fit the same 64 KiB message some stacks advertise. A page is read
+ * in chunks exactly like a file is.
+ */
+export const WEB_CHUNK = VFS_CHUNK;
 
 /* ------------------------------------------------------------------------------------------------
  * auth
@@ -239,6 +248,65 @@ export interface VfsShareRemoveRequest {
 	id: string;
 }
 
+/* ------------------------------------------------------------------------------------------------
+ * web
+ *
+ * A page the host fetched. The browser cannot frame most of the web, so the host asks for the page
+ * with its own IP and its own request, tidies it into something that can be framed, and hands it
+ * back. The body is read in chunks the way a file is, and each page lives in the session that asked
+ * for it until four more are fetched.
+ * ---------------------------------------------------------------------------------------------- */
+
+export interface WebFetchRequest {
+	/** A full `http:` or `https:` URL. Anything else is refused. */
+	url: string;
+}
+
+export interface WebFetchReply {
+	/** Handle for this page inside this session. Read the body with `web:read`. */
+	id: string;
+	/** Where the fetch actually ended, after redirects. */
+	url: string;
+	/** The page's own title, when it has one. */
+	title: string | null;
+	contentType: string;
+	/** Whole body size, in bytes. */
+	size: number;
+	/** True when the page was cut off at the host's limit. */
+	truncated: boolean;
+}
+
+export interface WebReadRequest {
+	id: string;
+	offset: number;
+	length: number;
+}
+
+export interface WebReadReply {
+	/** Base64 of this slice of the page. */
+	data: string;
+	size: number;
+	/** True when this slice reaches the end. */
+	done: boolean;
+}
+
+/**
+ * Asks the host to look at a page's *headers* only, without carrying the page back. The browser
+ * uses it to tell a page that loaded quickly apart from a page that was refused: a site that
+ * sends `X-Frame-Options` or a `frame-ancestors` policy is the one case the proxy exists for.
+ */
+export interface WebProbeRequest {
+	url: string;
+}
+
+export interface WebProbeReply {
+	/** The header that would keep this page out of a frame, or null when nothing would. */
+	framing: 'x-frame-options' | 'frame-ancestors' | null;
+	/** The header's own value, for a log line the user can read. */
+	detail: string | null;
+	status: number;
+}
+
 /** An external change the host noticed in a shared folder. */
 export interface VfsChangedEvent {
 	shareId: string;
@@ -393,6 +461,10 @@ export interface RpcSpec {
 	'vfs:shares': { payload: Record<string, never>; reply: VfsSharesReply };
 	'vfs:share-add': { payload: VfsShareAddRequest; reply: VfsShareAddReply };
 	'vfs:share-remove': { payload: VfsShareRemoveRequest; reply: Record<string, never> };
+
+	'web:fetch': { payload: WebFetchRequest; reply: WebFetchReply };
+	'web:read': { payload: WebReadRequest; reply: WebReadReply };
+	'web:probe': { payload: WebProbeRequest; reply: WebProbeReply };
 
 	'anki:status': { payload: Record<string, never>; reply: AnkiStatusReply };
 	'anki:set-enabled': { payload: AnkiSetEnabledRequest; reply: AnkiStatusReply };
