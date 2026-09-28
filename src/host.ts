@@ -85,6 +85,7 @@ export class RiozeLinkHost implements SessionHost {
 
 	private readonly options: RiozeLinkHostOptions;
 	private readonly sessions = new Map<string, ClientSession>();
+	private readonly sessionsByConnection = new Map<string, ClientSession>();
 	private readonly links = new Map<string, PeerLink>();
 	private readonly channelTimeouts = new Map<string, NodeJS.Timeout>();
 	private readonly watcher: ShareWatcher;
@@ -182,6 +183,10 @@ export class RiozeLinkHost implements SessionHost {
 			},
 			onClosed: (reason) => {
 				this.links.delete(connection.id);
+				// A peer that vanished without a goodbye still has to leave the session table, or the
+				// client count starts telling stories.
+				this.sessionsByConnection.get(connection.id)?.dispose(`the link ended (${reason})`);
+				this.sessionsByConnection.delete(connection.id);
 				this.log('info', `link with ${connection.clientName} ended (${reason})`);
 			},
 			log: (message) => this.log('info', message)
@@ -223,11 +228,15 @@ export class RiozeLinkHost implements SessionHost {
 	private attachChannel(connection: SignalingConnection, channel: RTCDataChannel): void {
 		const session = new ClientSession(channel, this, connection.kind, connection.clientName);
 		this.sessions.set(session.id, session);
+		this.sessionsByConnection.set(connection.id, session);
 		this.notify();
 	}
 
 	sessionClosed(session: ClientSession): void {
 		this.sessions.delete(session.id);
+		for (const [connectionId, active] of this.sessionsByConnection) {
+			if (active === session) this.sessionsByConnection.delete(connectionId);
+		}
 		this.notify();
 	}
 
