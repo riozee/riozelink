@@ -11,7 +11,7 @@ import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import path from 'node:path';
 import { homedir } from 'node:os';
-import { DEFAULT_RELAY_URL, type AiProvider } from './protocol.ts';
+import { DEFAULT_SIGNAL_URL, type AiProvider } from './protocol.ts';
 import { slugify } from './util.ts';
 
 export interface ShareRecord {
@@ -43,8 +43,11 @@ export interface AuthorizedClient {
 export interface HostConfig {
 	version: 1;
 	hostName: string;
-	/** Where both ends meet to swap introductions. Any copy of the relay protocol speaks it. */
-	relay: string;
+	/**
+	 * The signaling server both ends dial out to. Any PeerServer speaks it: the public cloud,
+	 * `npx peerjs` on this machine, or the one you host later.
+	 */
+	signal: string;
 	folders: Record<string, ShareRecord>;
 	anki: AnkiConfig;
 	ai: AiConfig;
@@ -79,7 +82,7 @@ export function defaultConfig(): HostConfig {
 	return {
 		version: CONFIG_VERSION,
 		hostName: hostname(),
-		relay: DEFAULT_RELAY_URL,
+		signal: DEFAULT_SIGNAL_URL,
 		folders: {},
 		anki: { enabled: false, port: 8765 },
 		ai: {
@@ -105,9 +108,10 @@ export function normalizeConfig(raw: unknown): HostConfig {
 	const config = defaultConfig();
 	if (!isRecord(raw)) return config;
 
-	if (typeof raw.hostName === 'string' && raw.hostName.trim()) config.hostName = raw.hostName.trim();
-	if (typeof raw.relay === 'string' && /^wss?:\/\//.test(raw.relay.trim())) {
-		config.relay = raw.relay.trim();
+	if (typeof raw.hostName === 'string' && raw.hostName.trim())
+		config.hostName = raw.hostName.trim();
+	if (typeof raw.signal === 'string' && /^wss?:\/\//.test(raw.signal.trim())) {
+		config.signal = raw.signal.trim();
 	}
 
 	if (isRecord(raw.folders)) {
@@ -135,14 +139,16 @@ export function normalizeConfig(raw: unknown): HostConfig {
 		if (typeof raw.ai.endpoint === 'string' && raw.ai.endpoint.trim()) {
 			config.ai.endpoint = raw.ai.endpoint.trim().replace(/\/+$/, '');
 		}
-		if (typeof raw.ai.model === 'string' && raw.ai.model.trim()) config.ai.model = raw.ai.model.trim();
+		if (typeof raw.ai.model === 'string' && raw.ai.model.trim())
+			config.ai.model = raw.ai.model.trim();
 		if (typeof raw.ai.apiKey === 'string') config.ai.apiKey = raw.ai.apiKey;
 	}
 
 	if (isRecord(raw.authorizedClients)) {
 		for (const [fingerprint, value] of Object.entries(raw.authorizedClients)) {
 			if (!isRecord(value)) continue;
-			const label = typeof value.label === 'string' && value.label.trim() ? value.label.trim() : 'Browser';
+			const label =
+				typeof value.label === 'string' && value.label.trim() ? value.label.trim() : 'Browser';
 			const pairedAt = typeof value.pairedAt === 'number' ? value.pairedAt : Date.now();
 			config.authorizedClients[fingerprint] = { label, pairedAt };
 		}
@@ -162,10 +168,16 @@ export async function loadConfig(file: string = configFilePath()): Promise<HostC
 }
 
 /** Written through a temp file so a crash mid-write cannot leave a half JSON behind. */
-export async function saveConfig(config: HostConfig, file: string = configFilePath()): Promise<void> {
+export async function saveConfig(
+	config: HostConfig,
+	file: string = configFilePath()
+): Promise<void> {
 	await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
 	const temp = `${file}.tmp`;
-	await writeFile(temp, `${JSON.stringify(config, null, '\t')}\n`, { encoding: 'utf8', mode: 0o600 });
+	await writeFile(temp, `${JSON.stringify(config, null, '\t')}\n`, {
+		encoding: 'utf8',
+		mode: 0o600
+	});
 	await chmod(temp, 0o600).catch(() => undefined);
 	await rename(temp, file);
 }

@@ -16,7 +16,13 @@ import type { AnkiService } from './anki.ts';
 import type { AiService, AiStreamSink } from './ai.ts';
 import type { HostConfig, ShareRecord } from './config.ts';
 import { HostError, requireString, toErrorInfo } from './errors.ts';
-import { fingerprintOfPublicKey, importPublicKey, sign, verify, type HostIdentity } from './identity.ts';
+import {
+	fingerprintOfPublicKey,
+	importPublicKey,
+	sign,
+	verify,
+	type HostIdentity
+} from './identity.ts';
 import {
 	PROTOCOL_VERSION,
 	type AiChatRequest,
@@ -55,7 +61,8 @@ export interface SessionHost {
 	readonly anki: AnkiService;
 }
 
-export type SessionPhase = 'awaiting-hello' | 'awaiting-proof' | 'awaiting-pair' | 'ready' | 'closed';
+export type SessionPhase =
+	'awaiting-hello' | 'awaiting-proof' | 'awaiting-pair' | 'ready' | 'closed';
 
 const HELLO_TIMEOUT_MS = 20000;
 const AUTH_TIMEOUT_MS = 60000;
@@ -110,7 +117,10 @@ export class ClientSession {
 		try {
 			this.channel.send(text);
 		} catch (error) {
-			this.host.log('warn', `could not send to ${this.clientLabel || this.clientName}: ${(error as Error).message}`);
+			this.host.log(
+				'warn',
+				`could not send to ${this.clientLabel || this.clientName}: ${(error as Error).message}`
+			);
 		}
 	}
 
@@ -208,7 +218,8 @@ export class ClientSession {
 	}
 
 	private async onHello(payload: Record<string, unknown>): Promise<unknown> {
-		if (this.phase !== 'awaiting-hello') throw new HostError('hello was already received', 'invalid');
+		if (this.phase !== 'awaiting-hello')
+			throw new HostError('hello was already received', 'invalid');
 		const protocol = typeof payload.protocol === 'number' ? payload.protocol : 0;
 		if (protocol !== PROTOCOL_VERSION) {
 			throw new HostError(

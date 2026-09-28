@@ -1,7 +1,7 @@
 /**
  * The terminal face of the daemon.
  *
- * On a TTY it paints a small live panel: the four words RiozeOS will ask for, the relay both ends
+ * On a TTY it paints a small live panel: the four words RiozeOS will ask for, the signaling server both ends
  * meet on, who is connected, which folders are shared, and the last few things that happened.
  * `n` rolls a new phrase, `h` explains the first connection, `q` stops the daemon.
  *
@@ -137,7 +137,7 @@ export class Dashboard {
 		lines.push(
 			`${this.paint(`RIozeLink ${host.hostVersion}`, 'bold')} ${this.paint('· listening', 'green')}`
 		);
-		lines.push(`${this.paint('relay    ', 'dim')} ${this.paint(host.relayUrl(), 'dim')}`);
+		lines.push(`${this.paint('signal   ', 'dim')} ${this.paint(host.signalUrl(), 'dim')}`);
 		lines.push(
 			`${this.paint('words    ', 'dim')} ${this.paint(host.currentPairingPhrase(), 'bold')} ` +
 				this.paint(`(${host.pairingRemainingLabel()} left)`, 'dim')

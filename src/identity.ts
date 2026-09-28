@@ -83,7 +83,10 @@ export async function loadOrCreateIdentity(directory: string): Promise<HostIdent
 }
 
 /** Signs with the host key. The result is the raw 64-byte `r||s` WebCrypto form. */
-export async function sign(identity: HostIdentity, data: Uint8Array): Promise<Uint8Array<ArrayBuffer>> {
+export async function sign(
+	identity: HostIdentity,
+	data: Uint8Array
+): Promise<Uint8Array<ArrayBuffer>> {
 	const key = await importPrivateKey(identity.privateKey);
 	const signature = await crypto.subtle.sign(SIGN_PARAMS, key, new Uint8Array(data));
 	return new Uint8Array(signature);

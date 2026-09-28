@@ -1,15 +1,17 @@
 #!/usr/bin/env bun
 /**
- * The command line. `riozelink` starts the daemon, `riozelink relay` runs a relay of your own,
- * and the other commands edit the config file without a daemon running, which is what a setup
- * script or a curious user wants.
+ * The command line. `riozelink` starts the daemon; the other commands edit the config file without
+ * a daemon running, which is what a setup script or a curious user wants.
+ *
+ * There is no `relay` command and no server to deploy: signaling is a public PeerServer by
+ * default, and `--signal` points both ends at your own when you want one.
  */
 import { stat } from 'node:fs/promises';
 import path from 'node:path';
 import { configFilePath, loadConfig, saveConfig, uniqueShareId } from './config.ts';
 import { Dashboard } from './dashboard.ts';
 import { HOST_VERSION, RiozeLinkHost } from './host.ts';
-import { createRelayServer, DEFAULT_RELAY_PORT } from './relay-server.ts';
+import { DEFAULT_SIGNAL_URL } from './protocol.ts';
 import { displayPath, maskKey, truncate } from './util.ts';
 
 interface ParsedArgs {
@@ -56,22 +58,11 @@ function flagString(args: ParsedArgs, name: string): string | undefined {
 	return typeof value === 'string' ? value : undefined;
 }
 
-function flagNumber(args: ParsedArgs, name: string): number | undefined {
-	const value = flagString(args, name);
-	if (value === undefined) return undefined;
-	const parsed = Number(value);
-	if (!Number.isInteger(parsed) || parsed < 0 || parsed > 65535) {
-		throw new Error(`--${name} must be a port number`);
-	}
-	return parsed;
-}
-
 function printHelp(): void {
 	process.stdout.write(`riozelink ${HOST_VERSION}
 
 Usage
   riozelink [serve]                 start the daemon (default command)
-  riozelink relay                   run a relay of your own
   riozelink folders list            show the shared folders
   riozelink folders add <path> [--label Notes]
   riozelink folders remove <id>
@@ -82,39 +73,40 @@ Usage
   riozelink --version
 
 Serve options
-  --relay <url>                     the meeting point (default wss://relay.rioze.dev)
+  --signal <url>                    the meeting point (default ${DEFAULT_SIGNAL_URL})
   --config-dir <path>               where config.json and identity.json live
   --stun <url>[,<url>]              STUN servers for the WebRTC candidates
   --quiet                           print the words once, then only log lines
 
-Relay options
-  --port <n>                        the port to listen on (default ${DEFAULT_RELAY_PORT})
-  --bind <address>                  the interface to listen on (default 0.0.0.0)
-
-The daemon never listens on a port. It dials out to a relay and parks a room there, so a
-browser anywhere can meet it. The pairing phrase on the panel is four words; it is replaced
-every fifteen minutes, or the moment a browser pairs. Nothing about the link is stored in
-riozeOS except the browser's own key pair.
+The daemon never listens on a port. It registers a peer id on a signaling server and waits,
+so a browser anywhere can meet it. That server is a public PeerServer by default; run
+"npx peerjs --port 9000" and pass --signal ws://your-host:9000/peerjs to use your own. No
+TURN server is involved, which is the one limitation worth knowing: on a hostile network the
+peers may not be able to reach each other at all. The pairing phrase on the panel is four
+words; it is replaced every fifteen minutes, or the moment a browser pairs.
 `);
 }
 
 async function serve(args: ParsedArgs): Promise<void> {
 	const quiet = args.flags.get('quiet') === true;
 	const configDir = flagString(args, 'config-dir');
-	const relay = flagString(args, 'relay');
+	const signal = flagString(args, 'signal');
 	const stun = flagString(args, 'stun')
 		?.split(',')
 		.map((url) => url.trim())
 		.filter(Boolean);
 	const host = await RiozeLinkHost.create({
 		configDir,
-		relay,
-		iceServers: stun
+		signal,
+		iceServers: stun,
+		// A quiet daemon has no panel, so its lines go straight out. A service that reports nothing
+		// is a service nobody can diagnose.
+		onLog: quiet ? (entry) => process.stdout.write(`${entry.level} ${entry.message}\n`) : undefined
 	});
 	await host.start();
 
 	if (quiet) {
-		process.stdout.write(`relay ${host.relayUrl()}\nwords ${host.currentPairingPhrase()}\n`);
+		process.stdout.write(`signal ${host.signalUrl()}\nwords ${host.currentPairingPhrase()}\n`);
 	}
 
 	const dashboard = quiet
@@ -140,31 +132,6 @@ async function serve(args: ParsedArgs): Promise<void> {
 		// Stay alive without a panel; the process is the service.
 		await new Promise(() => undefined);
 	}
-}
-
-async function relay(args: ParsedArgs): Promise<void> {
-	const port = flagNumber(args, 'port') ?? DEFAULT_RELAY_PORT;
-	const bind = flagString(args, 'bind') ?? '0.0.0.0';
-	const server = await createRelayServer({
-		port,
-		host: bind,
-		log: (level, message) => process.stderr.write(`${level}: ${message}\n`)
-	});
-	process.stdout.write(
-		`relay listening on ${bind}:${server.port}\n` +
-			`point a daemon at it with: riozelink --relay ws://<host>:${server.port}\n` +
-			`and a browser at wss:// on the same address (https pages need wss; http can use ws)\n`
-	);
-
-	let stopping = false;
-	const shutdown = (): void => {
-		if (stopping) return;
-		stopping = true;
-		void server.close().then(() => process.exit(0));
-	};
-	process.on('SIGINT', shutdown);
-	process.on('SIGTERM', shutdown);
-	await new Promise(() => undefined);
 }
 
 async function folders(args: ParsedArgs): Promise<void> {
@@ -238,7 +205,9 @@ async function clients(args: ParsedArgs): Promise<void> {
 		if (!match) throw new Error(`no paired browser matches ${needle}`);
 		delete config.authorizedClients[match[0]];
 		await saveConfig(config, file);
-		process.stdout.write(`Revoked ${match[1].label}. Its room is gone the next time the daemon starts.\n`);
+		process.stdout.write(
+			`Revoked ${match[1].label}. Its room is gone the next time the daemon starts.\n`
+		);
 		return;
 	}
 
@@ -249,7 +218,7 @@ async function status(): Promise<void> {
 	const config = await loadConfig(configFilePath());
 	process.stdout.write(`config    ${displayPath(configFilePath())}\n`);
 	process.stdout.write(`host      ${config.hostName}\n`);
-	process.stdout.write(`relay     ${config.relay}\n`);
+	process.stdout.write(`signal    ${config.signal}\n`);
 	const shares = Object.entries(config.folders);
 	process.stdout.write(`shares    ${shares.length}\n`);
 	for (const [id, share] of shares) {
@@ -260,7 +229,9 @@ async function status(): Promise<void> {
 	for (const [fingerprint, client] of clients) {
 		process.stdout.write(`  ${client.label}\t${fingerprint.slice(0, 12)}…\n`);
 	}
-	process.stdout.write(`anki      ${config.anki.enabled ? `on (port ${config.anki.port})` : 'off'}\n`);
+	process.stdout.write(
+		`anki      ${config.anki.enabled ? `on (port ${config.anki.port})` : 'off'}\n`
+	);
 	process.stdout.write(
 		`ai        ${config.ai.enabled ? 'on' : 'off'} · ${config.ai.provider} · ${config.ai.model}${config.ai.apiKey ? ` · key ${maskKey(config.ai.apiKey)}` : ' · no key'}\n`
 	);
@@ -279,9 +250,6 @@ async function main(): Promise<void> {
 	switch (args.command) {
 		case 'serve':
 			await serve(args);
-			return;
-		case 'relay':
-			await relay(args);
 			return;
 		case 'folders':
 			await folders(args);

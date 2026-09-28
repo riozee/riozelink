@@ -1,10 +1,10 @@
 /**
- * End to end: a real daemon, a real relay, a real WebRTC handshake, a real config file.
+ * End to end: a real daemon, a real PeerServer, a real WebRTC handshake, a real config file.
  *
- * Everything the client does here travels the same path the browser app will take: a WebSocket
- * join to the relay, an SDP exchange, a DataChannel, the auth exchange, then RPC. Only the peer
- * implementation differs (werift instead of the browser stack), which is exactly the part
- * `protocol.ts` does not care about.
+ * Everything the client does here travels the same path the browser app will take: a signaling
+ * registration, an SDP exchange through the server, a DataChannel, the auth exchange, then RPC.
+ * Only the peer implementation differs (werift instead of the browser stack), which is exactly the
+ * part `protocol.ts` does not care about.
  */
 import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
@@ -13,15 +13,14 @@ import path from 'node:path';
 import { loadConfig } from '../src/config.ts';
 import { RiozeLinkHost } from '../src/host.ts';
 import {
+	pairId,
 	VFS_CHUNK,
-	pairRoom,
 	type AuthOkPayload,
 	type StatusInfoReply,
 	type VfsShare
 } from '../src/protocol.ts';
-import type { RelayServer } from '../src/relay-server.ts';
 import { randomBytes, toBase64 } from '../src/util.ts';
-import { TestClient, mockAnki, mockOllama, startTestRelay, withTimeout } from './support.ts';
+import { TestClient, mockAnki, mockOllama, startTestSignal, withTimeout } from './support.ts';
 
 const TEST_TIMEOUT = 30000;
 
@@ -39,8 +38,8 @@ async function waitFor(predicate: () => boolean, what: string, timeoutMs = 8000)
 let root: string;
 let shareDir: string;
 let host: RiozeLinkHost;
-let relayUrl: string;
-let relay: RelayServer;
+let signalUrl: string;
+let signal: { url: string; close(): Promise<void> };
 let anki: { port: number; stop(): void };
 let ollama: { port: number; stop(): void };
 let primary: TestClient;
@@ -54,13 +53,12 @@ beforeAll(async () => {
 	await writeFile(path.join(shareDir, 'sub', 'nested.txt'), 'nested');
 	anki = mockAnki();
 	ollama = mockOllama();
-	const started = await startTestRelay();
-	relayUrl = started.url;
-	relay = started.server;
+	signal = await startTestSignal();
+	signalUrl = signal.url;
 
 	host = await RiozeLinkHost.create({
 		configDir: path.join(root, 'config'),
-		relay: relayUrl
+		signal: signalUrl
 	});
 	host.config.anki.port = anki.port;
 	host.config.ai.provider = 'ollama';
@@ -73,22 +71,22 @@ beforeAll(async () => {
 afterAll(async () => {
 	primary?.close();
 	await host.stop('the test finished');
-	await relay.close();
+	await signal.close();
 	anki.stop();
 	ollama.stop();
 	await rm(root, { recursive: true, force: true });
 });
 
 test(
-	'one phrase names one room, however it is typed',
+	'one phrase names one meeting point, however it is typed',
 	async () => {
-		expect(await pairRoom('amber-cobalt-summit-drift')).toBe(
-			await pairRoom('  Amber Cobalt-Summit_drift  ')
+		expect(await pairId('amber-cobalt-summit-drift')).toBe(
+			await pairId('  Amber Cobalt-Summit_drift  ')
 		);
 		const phrase = host.currentPairingPhrase();
 		expect(phrase.split('-').length).toBe(4);
-			await waitFor(() => host.anchoredRooms() >= 1, 'the host to reach the relay');
-		primary = await TestClient.connect(relayUrl, await pairRoom(phrase), {
+		await waitFor(() => host.anchoredLinks() >= 1, 'the host to reach the signaling server');
+		primary = await TestClient.connect(signalUrl, await pairId(phrase), {
 			name: 'Test Browser'
 		});
 		const hello = await primary.hello();
@@ -101,7 +99,7 @@ test(
 
 		const status = (await primary.call('status', 'info')) as StatusInfoReply;
 		expect(status.connectedClients).toBe(1);
-		expect(status.relay).toBe(relayUrl);
+		expect(status.signal).toBe(signalUrl);
 		expect(status.shares.length).toBe(1);
 		const share = status.shares[0] as VfsShare;
 		expect(share.id).toBe('notes');
@@ -116,7 +114,7 @@ test(
 test(
 	'a returning client proves its key instead of asking for words',
 	async () => {
-		const returning = await TestClient.connect(relayUrl, await primary.roomForReconnect(), {
+		const returning = await TestClient.connect(signalUrl, await primary.idForReconnect(), {
 			name: 'Test Browser',
 			keyPair: primary.keyPair
 		});
@@ -196,11 +194,18 @@ test(
 		};
 		expect(afterMkdir.entry?.kind).toBe('dir');
 
-		await primary.call('vfs', 'rename', { share: 'notes', from: '/hello.txt', to: '/sub/renamed.txt' });
+		await primary.call('vfs', 'rename', {
+			share: 'notes',
+			from: '/hello.txt',
+			to: '/sub/renamed.txt'
+		});
 		const renamed = await readFile(path.join(shareDir, 'sub', 'renamed.txt'), 'utf8');
 		expect(renamed).toBe('hello from the host');
 
-		const missing = (await primary.call('vfs', 'stat', { share: 'notes', path: '/renamed.txt' })) as {
+		const missing = (await primary.call('vfs', 'stat', {
+			share: 'notes',
+			path: '/renamed.txt'
+		})) as {
 			entry: unknown;
 		};
 		expect(missing.entry).toBeNull();
@@ -211,10 +216,15 @@ test(
 		};
 		expect(gone.entry).toBeNull();
 
-		const listingsAfterWrite = (await primary.call('vfs', 'list', { share: 'notes', path: '/' })) as {
+		const listingsAfterWrite = (await primary.call('vfs', 'list', {
+			share: 'notes',
+			path: '/'
+		})) as {
 			entries: Array<{ name: string }>;
 		};
-		expect(listingsAfterWrite.entries.some((entry) => entry.name.includes('riozelink-part'))).toBe(false);
+		expect(listingsAfterWrite.entries.some((entry) => entry.name.includes('riozelink-part'))).toBe(
+			false
+		);
 	},
 	TEST_TIMEOUT
 );
@@ -370,7 +380,7 @@ test(
 	'a second client pairs with fresh words, and both see the aggregate count',
 	async () => {
 		const phrase = host.currentPairingPhrase();
-		const second = await TestClient.connect(relayUrl, await pairRoom(phrase), {
+		const second = await TestClient.connect(signalUrl, await pairId(phrase), {
 			name: 'Second Window'
 		});
 		try {
@@ -391,11 +401,11 @@ test(
 			second.close();
 		}
 
-		// The used words are retired. Someone who found the room but not the words is turned away,
-		// which is exactly what the proof and the failure limit are for.
+		// The used words are retired. Someone who found the meeting point but not the words is turned
+		// away, which is exactly what the proof and the failure limit are for.
 		const impostor = await TestClient.connect(
-			relayUrl,
-			await pairRoom(host.currentPairingPhrase()),
+			signalUrl,
+			await pairId(host.currentPairingPhrase()),
 			{ name: 'Impostor' }
 		);
 		try {

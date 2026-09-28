@@ -57,7 +57,9 @@ export async function listShare(share: ShareRecord, remotePath: string): Promise
 			// A file that vanished between the listing and the stat is simply not reported.
 		}
 	}
-	entries.sort((a, b) => (a.kind === b.kind ? a.name.localeCompare(b.name) : a.kind === 'dir' ? -1 : 1));
+	entries.sort((a, b) =>
+		a.kind === b.kind ? a.name.localeCompare(b.name) : a.kind === 'dir' ? -1 : 1
+	);
 	return { entries };
 }
 
@@ -204,7 +206,8 @@ export async function removeShare(share: ShareRecord, remote: string): Promise<v
 }
 
 export async function renameShare(share: ShareRecord, from: string, to: string): Promise<void> {
-	if (from === '/' || to === '/') throw new HostError('the shared folder itself cannot be moved', 'denied');
+	if (from === '/' || to === '/')
+		throw new HostError('the shared folder itself cannot be moved', 'denied');
 	const source = await resolveSharePath(share, from);
 	const target = await resolveSharePath(share, to);
 	const clash = await stat(target.abs).catch(() => null);
@@ -269,7 +272,11 @@ export class ShareWatcher {
 		}
 	}
 
-	private queue(shareId: string, relative: string, kind: VfsChangedEvent['kind'] | 'touched'): void {
+	private queue(
+		shareId: string,
+		relative: string,
+		kind: VfsChangedEvent['kind'] | 'touched'
+	): void {
 		const remote = `/${relative}`;
 		if (kind === 'touched') {
 			const root = this.roots.get(shareId);

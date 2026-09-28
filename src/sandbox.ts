@@ -66,7 +66,10 @@ async function assertInside(root: string, target: string, remote: string): Promi
 		try {
 			const real = await realpath(probe);
 			if (!isWithin(root, real)) {
-				throw new HostError(`the path leaves the shared folder through a link: ${remote}`, 'denied');
+				throw new HostError(
+					`the path leaves the shared folder through a link: ${remote}`,
+					'denied'
+				);
 			}
 			return;
 		} catch (error) {

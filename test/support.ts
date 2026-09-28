@@ -1,24 +1,30 @@
 /**
- * Test-side pieces: a minimal RiozeOS client, a real relay, and two fake services.
+ * Test-side pieces: a minimal RiozeOS client, a real signaling server, and two fake services.
  *
  * The client speaks the same protocol the browser app does, with werift standing in for the
- * browser's WebRTC. That is the point of the exercise: if the daemon satisfies this, it will
- * satisfy the real client, because both sides only ever meet at `protocol.ts`.
+ * browser's WebRTC and the `peer` dev dependency standing in for 0.peerjs.com. That is the point
+ * of the exercise: if the daemon satisfies this, it will satisfy the real client, because both
+ * sides only ever meet at `protocol.ts`.
  */
+import type { Server } from 'node:http';
+import { PeerServer } from 'peer';
 import { RTCPeerConnection, type RTCDataChannel } from 'werift';
 import { fingerprintOfPublicKey } from '../src/identity.ts';
 import {
-	PROTOCOL_VERSION,
-	linkRoom,
+	candidatePayload,
+	isOfferPayload,
+	linkId,
+	makeSignalId,
+	offerPayload,
 	pairProof,
-	pairRoom,
+	PROTOCOL_VERSION,
+	signalSocketUrl,
 	type AuthHelloReply,
 	type AuthOkPayload,
-	type RelayMessage,
 	type RpcWire,
+	type SignalMessage,
 	type SignalPayload
 } from '../src/protocol.ts';
-import { createRelayServer, type RelayServer } from '../src/relay-server.ts';
 import { fromBase64, randomNonce, toBase64 } from '../src/util.ts';
 
 const KEY_PARAMS: EcKeyGenParams = { name: 'ECDSA', namedCurve: 'P-256' };
@@ -26,11 +32,24 @@ const SIGN_PARAMS: EcdsaParams = { name: 'ECDSA', hash: 'SHA-256' };
 
 const CHANNEL_TIMEOUT_MS = 20000;
 const CALL_TIMEOUT_MS = 20000;
+const OFFER_RETRY_MS = 2000;
+const OFFER_ATTEMPTS = 8;
 
-/** A relay of the tests' own, on a loopback port nothing else is using. */
-export async function startTestRelay(): Promise<{ url: string; server: RelayServer }> {
-	const server = await createRelayServer({ port: 0, host: '127.0.0.1' });
-	return { url: `ws://127.0.0.1:${server.port}`, server };
+/**
+ * A signaling server of the tests' own: the real PeerServer package, on a loopback port nothing
+ * else is using. The daemon and the test client both only see a URL.
+ */
+export async function startTestSignal(): Promise<{ url: string; close(): Promise<void> }> {
+	const http = await new Promise<Server>((resolve) => {
+		PeerServer({ port: 0, host: '127.0.0.1', path: '/' }, (server) => resolve(server));
+	});
+	const address = http.address();
+	if (!address || typeof address === 'string')
+		throw new Error('the test signal server has no port');
+	return {
+		url: `ws://127.0.0.1:${address.port}`,
+		close: () => new Promise<void>((resolve) => http.close(() => resolve()))
+	};
 }
 
 export function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
@@ -57,12 +76,13 @@ export interface TestEvent {
 
 export class TestClient {
 	static async connect(
-		relayUrl: string,
-		room: string,
+		signalUrl: string,
+		targetId: string,
 		options: { name?: string; keyPair?: CryptoKeyPair } = {}
 	): Promise<TestClient> {
 		const client = new TestClient();
 		client.name = options.name ?? 'Test Browser';
+		client.targetId = targetId;
 		client.keyPair =
 			options.keyPair ?? (await crypto.subtle.generateKey(KEY_PARAMS, true, ['sign', 'verify']));
 		const spki = await crypto.subtle.exportKey('spki', client.keyPair.publicKey);
@@ -74,70 +94,65 @@ export class TestClient {
 			client.onText(typeof data === 'string' ? data : data.toString('utf8'));
 		});
 
-		const socket = new WebSocket(relayUrl);
+		const socket = new WebSocket(signalSocketUrl(signalUrl, client.signalId, `${Math.random()}`));
 		client.socket = socket;
+		socket.onmessage = (event) => void client.onSignalMessage(String(event.data));
+		const registered = new Promise<void>((resolve, reject) => {
+			client.onRegistered = resolve;
+			client.onSignalFailure = reject;
+			setTimeout(() => reject(new Error('the signaling server never registered us')), 8000);
+		});
 		await new Promise<void>((resolve, reject) => {
-			const timer = setTimeout(() => reject(new Error('the relay socket did not open')), 8000);
+			const timer = setTimeout(() => reject(new Error('the signaling socket did not open')), 8000);
 			socket.onopen = () => {
 				clearTimeout(timer);
 				resolve();
 			};
 			socket.onerror = () => {
 				clearTimeout(timer);
-				reject(new Error('the relay socket failed'));
+				reject(new Error('the signaling socket failed'));
 			};
 		});
-
-		const joined = new Promise<number>((resolve, reject) => {
-			const timer = setTimeout(() => reject(new Error('the room never answered')), 8000);
-			client.onSignal = (message) => {
-				if (message.t === 'joined') {
-					clearTimeout(timer);
-					resolve(message.peers);
-				}
-				if (message.t === 'peer' && message.event === 'joined') {
-					client.onPeerJoined?.();
-				}
-				if (message.t === 'error') {
-					clearTimeout(timer);
-					reject(new Error(message.reason));
-				}
-			};
-			socket.onmessage = (event) => {
-				const message = JSON.parse(String(event.data)) as RelayMessage;
-				if (message.t === 'signal') void client.onRemoteSignal(message.data);
-				else client.onSignal?.(message);
-			};
-		});
-		socket.send(JSON.stringify({ t: 'join', room, role: 'client', name: client.name }));
-		const peers = await joined;
+		await registered;
 
 		client.peer.onIceCandidate.subscribe((candidate) => {
+			if (!candidate) return;
 			client.send({
-				t: 'signal',
-				data: { type: 'candidate', candidate: candidate ? candidate.toJSON() : null }
+				type: 'CANDIDATE',
+				dst: targetId,
+				payload: candidatePayload(candidate.toJSON(), client.connectionId)
 			});
 		});
 
-		// The daemon may still be dialing its own side of the room. Offering into an empty room
-		// would be offering to nobody, so the offer waits for the other member to arrive instead.
+		// A server queues frames for an id that is not registered yet and drops the queue after a
+		// few seconds, so an offer that arrived too early is simply offered again. The real client
+		// retries the same way.
 		const offer = async (): Promise<void> => {
 			const description = await client.peer.createOffer();
 			await client.peer.setLocalDescription({ type: 'offer', sdp: description.sdp });
-			client.send({ t: 'signal', data: { type: 'offer', sdp: description.sdp } });
+			client.send({
+				type: 'OFFER',
+				dst: targetId,
+				payload: offerPayload(description.sdp ?? '', client.connectionId)
+			});
 		};
-		if (peers > 0) {
-			await offer();
-		} else {
-			await withTimeout(
-				new Promise<void>((resolve) => {
-					client.onPeerJoined = resolve;
-				}),
-				8000,
-				'the host to join the room'
-			);
+		await offer();
+		const answered = withTimeout(
+			new Promise<void>((resolve) => {
+				client.sawAnswer = resolve;
+			}),
+			CHANNEL_TIMEOUT_MS,
+			'the host to answer an offer'
+		);
+		for (let attempt = 1; attempt < OFFER_ATTEMPTS; attempt += 1) {
+			const retry = await Promise.race([
+				answered.then(() => false),
+				new Promise<boolean>((resolve) => setTimeout(() => resolve(true), OFFER_RETRY_MS))
+			]);
+			if (!retry) break;
 			await offer();
 		}
+		await answered;
 
 		await withTimeout(
 			new Promise<void>((resolve) => {
@@ -148,6 +163,7 @@ export class TestClient {
 			CHANNEL_TIMEOUT_MS,
 			'the data channel'
 		);
+		client.startHeartbeat();
 		return client;
 	}
 
@@ -156,12 +172,18 @@ export class TestClient {
 	name = 'Test Browser';
 	publicKey = '';
 	keyPair!: CryptoKeyPair;
+	/** This client's own peer id on the signaling server. */
+	readonly signalId = makeSignalId();
+	readonly connectionId = `test-${Math.random().toString(16).slice(2, 10)}`;
 
+	private targetId = '';
 	private peer!: RTCPeerConnection;
 	private channel!: RTCDataChannel;
 	private socket!: WebSocket;
-	private onSignal: ((message: RelayMessage) => void) | null = null;
-	private onPeerJoined: (() => void) | null = null;
+	private heartbeat: NodeJS.Timeout | null = null;
+	private onRegistered: (() => void) | null = null;
+	private onSignalFailure: ((error: Error) => void) | null = null;
+	private sawAnswer: (() => void) | null = null;
 	private readonly pending = new Map<string, (message: RpcWire & { kind: 'res' }) => void>();
 	private readonly waiters: Array<{
 		action: string;
@@ -170,25 +192,58 @@ export class TestClient {
 	}> = [];
 	private seq = 0;
 
-	private send(message: RelayMessage): void {
+	private send(message: SignalMessage): void {
 		this.socket.send(JSON.stringify(message));
 	}
 
-	private async onRemoteSignal(data: SignalPayload): Promise<void> {
-		if (data.type === 'answer') {
-			await this.peer.setRemoteDescription({ type: 'answer', sdp: data.sdp });
+	private startHeartbeat(): void {
+		this.heartbeat = setInterval(() => {
+			if (this.socket.readyState === WebSocket.OPEN)
+				this.socket.send(JSON.stringify({ type: 'HEARTBEAT' }));
+		}, 5000);
+	}
+
+	private async onSignalMessage(text: string): Promise<void> {
+		let message: SignalMessage;
+		try {
+			message = JSON.parse(text) as SignalMessage;
+		} catch {
 			return;
 		}
-		if (data.type === 'candidate') {
-			if (!data.candidate) {
-				await this.peer.addIceCandidate(null);
+		switch (message.type) {
+			case 'OPEN':
+				this.onRegistered?.();
+				return;
+			case 'HEARTBEAT':
+				this.socket.send(JSON.stringify({ type: 'HEARTBEAT' }));
+				return;
+			case 'ID-TAKEN':
+			case 'INVALID-KEY':
+			case 'ERROR':
+				this.onSignalFailure?.(new Error(`the signaling server refused us: ${message.type}`));
+				return;
+			case 'ANSWER':
+			case 'CANDIDATE': {
+				const payload = message.payload as SignalPayload | undefined;
+				if (!payload) return;
+				if (isOfferPayload(payload)) {
+					await this.peer.setRemoteDescription({ type: 'answer', sdp: payload.sdp.sdp });
+					this.sawAnswer?.();
+					return;
+				}
+				if (!payload.candidate) {
+					await this.peer.addIceCandidate(null);
+					return;
+				}
+				await this.peer.addIceCandidate({
+					candidate: payload.candidate.candidate,
+					sdpMid: payload.candidate.sdpMid,
+					sdpMLineIndex: payload.candidate.sdpMLineIndex
+				});
 				return;
 			}
-			await this.peer.addIceCandidate({
-				candidate: data.candidate.candidate,
-				sdpMid: data.candidate.sdpMid,
-				sdpMLineIndex: data.candidate.sdpMLineIndex
-			});
+			default:
+				return;
 		}
 	}
 
@@ -314,15 +369,16 @@ export class TestClient {
 		return (await this.call('auth', 'prove', { signature })) as AuthOkPayload;
 	}
 
-	/** The room this client and the host meet in after pairing. No words needed, ever again. */
-	async roomForReconnect(): Promise<string> {
+	/** The peer id this client and the host meet at after pairing. No words needed, ever again. */
+	async idForReconnect(): Promise<string> {
 		if (!this.helloReply) throw new Error('hello first');
 		const hostHex = fingerprintOfPublicKey(this.helloReply.publicKey).fingerprintHex;
 		const ownHex = fingerprintOfPublicKey(this.publicKey).fingerprintHex;
-		return linkRoom(hostHex, ownHex);
+		return linkId(hostHex, ownHex);
 	}
 
 	close(): void {
+		if (this.heartbeat) clearInterval(this.heartbeat);
 		try {
 			this.channel.close();
 		} catch {
@@ -336,8 +392,6 @@ export class TestClient {
 		this.socket.close();
 	}
 }
-
-export { pairRoom };
 
 /** A fake AnkiConnect. Two actions, one of which fails on purpose. */
 export function mockAnki(): { port: number; stop(): void } {

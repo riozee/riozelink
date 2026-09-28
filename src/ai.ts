@@ -169,7 +169,9 @@ export class AiService {
 				model: payload.model ?? ai.model,
 				messages,
 				stream: true,
-				...(typeof payload.temperature === 'number' ? { options: { temperature: payload.temperature } } : {})
+				...(typeof payload.temperature === 'number'
+					? { options: { temperature: payload.temperature } }
+					: {})
 			},
 			undefined,
 			signal
@@ -216,14 +218,16 @@ export class AiService {
 			const parsed = this.parseJsonLine(data);
 			if (!parsed) return;
 			if (isRecord(parsed.error)) {
-				const message = typeof parsed.error.message === 'string' ? parsed.error.message : 'request failed';
+				const message =
+					typeof parsed.error.message === 'string' ? parsed.error.message : 'request failed';
 				throw new HostError(`the endpoint said: ${truncate(message, 300)}`, 'io');
 			}
 			const choices = Array.isArray(parsed.choices) ? parsed.choices : [];
 			const first = choices[0];
-			const delta = isRecord(first) && isRecord(first.delta) && typeof first.delta.content === 'string'
-				? first.delta.content
-				: '';
+			const delta =
+				isRecord(first) && isRecord(first.delta) && typeof first.delta.content === 'string'
+					? first.delta.content
+					: '';
 			if (delta) {
 				text += delta;
 				sink.chunk(streamId, delta);

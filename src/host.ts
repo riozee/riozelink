@@ -1,14 +1,15 @@
 /**
  * The daemon itself.
  *
- * One identity, one config file, one relay, one set of shared folders. The host dials *out*: it
- * holds a room for the pairing phrase and one room for every client it has paired with, so nothing
- * here ever asks the user for an address, a port, or a network that happens to be local.
+ * One identity, one config file, one signaling server, one set of shared folders. The host dials
+ * *out*: it registers one peer id for the pairing phrase and one for every browser it has paired
+ * with, so nothing here ever asks the user for an address, a port, or a network that happens to be
+ * local.
  *
  * The pairing phrase is the only secret that ever appears in a terminal. It lives for fifteen
  * minutes or until a client successfully pairs, whichever comes first, and ten failed attempts
- * replace it early. After that the phrase is dead weight: returning clients meet the host in a
- * room named after both their fingerprints and authenticate with their own key.
+ * replace it early. After that the phrase is dead weight: returning clients meet the host under an
+ * id named after both their fingerprints and authenticate with their own key.
  */
 import { stat } from 'node:fs/promises';
 import { timingSafeEqual } from 'node:crypto';
@@ -28,22 +29,22 @@ import { HostError } from './errors.ts';
 import { loadOrCreateIdentity, type HostIdentity } from './identity.ts';
 import { createPeerLink, type PeerLink } from './peer.ts';
 import {
-	linkRoom,
+	linkId,
+	pairId,
 	pairProof,
-	pairRoom,
 	PROTOCOL_VERSION,
 	type AnkiStatusReply,
 	type RpcSubsystem,
 	type SignalPayload,
 	type StatusInfoReply
 } from './protocol.ts';
-import { RelayLink } from './relay.ts';
+import { SignalLink } from './signal.ts';
 import { ClientSession, type SessionHost } from './session.ts';
 import { ShareWatcher, sharesReply, sweepPartials } from './vfs.ts';
 import { displayPath, formatDuration, truncate } from './util.ts';
 import { generatePhrase } from './words.ts';
 
-export const HOST_VERSION = '0.2.0';
+export const HOST_VERSION = '0.3.0';
 
 const PAIRING_TTL_MS = 15 * 60_000;
 const MAX_PAIRING_FAILURES = 10;
@@ -62,21 +63,22 @@ export interface LogEntry {
 export interface RiozeLinkHostOptions {
 	/** Moves `config.json` and `identity.json` somewhere else. The tests use it. */
 	configDir?: string;
-	/** Overrides the relay URL in the config file. */
-	relay?: string;
+	/** Overrides the signaling server URL in the config file. */
+	signal?: string;
 	hostName?: string;
 	iceServers?: string[];
 	onLog?(entry: LogEntry): void;
 	onUpdate?(): void;
 }
 
-/** One room on the relay, plus whatever came out of it. */
-interface HostRoom {
-	room: string;
+/** One registration with the signaling server, plus whatever came out of it. */
+interface HostLink {
+	/** The peer id this link holds. */
+	id: string;
 	kind: 'pair' | 'link';
-	/** The client label for a link room, `pairing` for the phrase room. */
+	/** The client label for a client link, `pairing` for the phrase one. */
 	label: string;
-	link: RelayLink;
+	link: SignalLink;
 	peer: PeerLink | null;
 	session: ClientSession | null;
 }
@@ -93,11 +95,11 @@ export class RiozeLinkHost implements SessionHost {
 
 	private readonly options: RiozeLinkHostOptions;
 	private readonly sessions = new Map<string, ClientSession>();
-	private readonly rooms = new Map<string, HostRoom>();
+	private readonly links = new Map<string, HostLink>();
 	private readonly watcher: ShareWatcher;
 	private readonly logs: LogEntry[] = [];
 	private readonly listeners = new Set<() => void>();
-	private relay: string;
+	private signalBase: string;
 	private pairingPhrase = generatePhrase();
 	private pairingCreatedAt = Date.now();
 	private pairingFailures = 0;
@@ -121,8 +123,8 @@ export class RiozeLinkHost implements SessionHost {
 		if (this.hostName !== config.hostName) {
 			this.config.hostName = this.hostName;
 		}
-		this.relay = options.relay?.trim() || config.relay;
-		if (this.relay !== config.relay) this.config.relay = this.relay;
+		this.signalBase = options.signal?.trim() || config.signal;
+		if (this.signalBase !== config.signal) this.config.signal = this.signalBase;
 		const hostServices = {
 			config: this.config,
 			save: () => this.save(),
@@ -149,7 +151,7 @@ export class RiozeLinkHost implements SessionHost {
 
 	async start(): Promise<void> {
 		this.watcher.update(this.config.folders);
-		await this.syncRooms();
+		await this.syncLinks();
 		this.startAnkiWatch();
 		void sweepPartials(this.config.folders).then((removed) => {
 			if (removed > 0) {
@@ -157,7 +159,7 @@ export class RiozeLinkHost implements SessionHost {
 			}
 		});
 		this.log('info', `RiozeLink ${this.hostVersion} ready for ${this.hostName}`);
-		this.log('info', `meeting point: ${this.relay}`);
+		this.log('info', `meeting point: ${this.signalBase}`);
 		this.notify();
 	}
 
@@ -167,84 +169,90 @@ export class RiozeLinkHost implements SessionHost {
 		if (this.ankiTimer) clearInterval(this.ankiTimer);
 		this.ankiTimer = null;
 		for (const session of [...this.sessions.values()]) session.dispose(reason);
-		for (const room of this.rooms.values()) room.link.close(reason);
-		this.rooms.clear();
+		for (const link of this.links.values()) link.link.close(reason);
+		this.links.clear();
 		this.log('info', reason);
 		this.notify();
 	}
 
-	/* -------------------------------------------------------------------- rooms ------- */
+	/* -------------------------------------------------------------------- links ------- */
 
 	/**
-	 * Makes the rooms on the relay match the rooms this host should be holding: the live pairing
-	 * phrase, plus one quiet room per paired client. Called at boot, after a phrase rotates, and
-	 * whenever the client list changes.
+	 * Makes the registrations on the signaling server match the ones this host should be holding:
+	 * the live pairing phrase, plus one quiet id per paired client. Called at boot, after a phrase
+	 * rotates, and whenever the client list changes.
 	 */
-	async syncRooms(): Promise<void> {
+	async syncLinks(): Promise<void> {
 		const desired = new Map<string, { kind: 'pair' | 'link'; label: string }>();
-		desired.set(await pairRoom(this.pairingPhrase), { kind: 'pair', label: 'pairing' });
+		desired.set(await pairId(this.pairingPhrase), { kind: 'pair', label: 'pairing' });
 		for (const [fingerprint, client] of Object.entries(this.config.authorizedClients)) {
-			desired.set(await linkRoom(this.identity.fingerprintHex, fingerprint), {
+			desired.set(await linkId(this.identity.fingerprintHex, fingerprint), {
 				kind: 'link',
 				label: client.label
 			});
 		}
 
-		for (const [room, entry] of [...this.rooms]) {
-			const wanted = desired.get(room);
+		for (const [id, entry] of [...this.links]) {
+			const wanted = desired.get(id);
 			if (wanted?.kind === entry.kind) continue;
-			this.rooms.delete(room);
-			// A link room only closes when the client behind it was revoked, so its session goes
-			// with it. A pair room is different: retiring the phrase must never hang up on the
-			// browser that just paired through it, and the DataChannel does not need the relay
-			// anymore anyway.
+			this.links.delete(id);
+			// A client link only closes when the browser behind it was revoked, so its session goes
+			// with it. The pairing link is different: retiring the phrase must never hang up on the
+			// browser that just paired through it, and the DataChannel does not need the signaling
+			// server anymore anyway.
 			if (entry.kind === 'link') {
-				entry.session?.dispose('its room closed');
-				entry.peer?.close('its room closed');
+				entry.session?.dispose('its registration closed');
+				entry.peer?.close('its registration closed');
 			}
-			entry.link.close('room closed');
+			entry.link.close('registration closed');
 		}
 
-		for (const [room, wanted] of desired) {
-			if (this.rooms.has(room)) continue;
-			this.openRoom(room, wanted.kind, wanted.label);
+		for (const [id, wanted] of desired) {
+			const existing = this.links.get(id);
+			if (!existing) {
+				this.openLink(id, wanted.kind, wanted.label);
+				continue;
+			}
+			// A registration that gave up has to be rebuilt, or the id stays dark forever and the
+			// browsers that belong to it find nobody home.
+			if (!existing.link.online && !existing.link.retrying) {
+				existing.link.close('reopening');
+				this.links.delete(id);
+				this.openLink(id, wanted.kind, wanted.label);
+			}
 		}
 	}
 
-	private openRoom(room: string, kind: 'pair' | 'link', label: string): void {
-		const entry: HostRoom = {
-			room,
+	private openLink(id: string, kind: 'pair' | 'link', label: string): void {
+		const entry: HostLink = {
+			id,
 			kind,
 			label,
-			link: null as unknown as RelayLink,
+			link: null as unknown as SignalLink,
 			peer: null,
 			session: null
 		};
-		this.rooms.set(room, entry);
-		entry.link = new RelayLink({
-			url: this.relay,
-			room,
-			role: 'host',
-			name: this.hostName,
-			onSignal: (data) => void this.handleSignal(entry, data),
-			onPeer: (event) => {
-				if (event === 'joined') {
-					this.log(
-						'info',
-						kind === 'pair'
-							? 'a browser is in the pairing room, waiting for the words'
-							: `a browser is reconnecting as ${label}`
-					);
-				}
-			},
-			onLost: (reason) => this.log('warn', `${reason} — the room stays open and retries`),
-			onFatal: (reason) => this.log('error', `the relay turned the ${kind} room away: ${reason}`),
+		this.links.set(id, entry);
+		entry.link = new SignalLink({
+			base: this.signalBase,
+			id,
+			onSignal: (payload, from) => void this.handleSignal(entry, payload, from),
+			onPeerLeft: (from) => this.log('info', `${from} left, or its offer expired`),
+			onOpen: () => this.notify(),
+			onLost: (reason) => this.log('warn', `${reason} — the registration stays and retries`),
+			onTaken: () =>
+				this.log(
+					'error',
+					kind === 'link'
+						? `another daemon with this identity is already registered as ${label}`
+						: 'another daemon with this identity is already registered. Stop it and start again.'
+				),
 			log: (level, message) => this.log(level, message)
 		});
 		entry.link.connect();
 	}
 
-	private async handleSignal(entry: HostRoom, data: SignalPayload): Promise<void> {
+	private async handleSignal(entry: HostLink, data: SignalPayload, from: string): Promise<void> {
 		if (!entry.peer) {
 			entry.peer = createPeerLink({
 				iceServers: this.options.iceServers ?? [],
@@ -256,7 +264,7 @@ export class RiozeLinkHost implements SessionHost {
 						entry.session.dispose(`the link ended (${reason})`);
 					}
 					entry.session = null;
-					this.log('info', `the link in the ${entry.kind} room ended (${reason})`);
+					this.log('info', `the ${entry.kind} link with ${from} ended (${reason})`);
 				},
 				log: (message) => this.log('info', message)
 			});
@@ -264,7 +272,7 @@ export class RiozeLinkHost implements SessionHost {
 		await entry.peer.handleSignal(data);
 	}
 
-	private attachChannel(entry: HostRoom, channel: RTCDataChannel): void {
+	private attachChannel(entry: HostLink, channel: RTCDataChannel): void {
 		if (entry.session && entry.session.phase !== 'closed') {
 			entry.session.dispose('a new link took over');
 		}
@@ -276,8 +284,14 @@ export class RiozeLinkHost implements SessionHost {
 
 	sessionClosed(session: ClientSession): void {
 		this.sessions.delete(session.id);
-		for (const entry of this.rooms.values()) {
-			if (entry.session === session) entry.session = null;
+		for (const entry of this.links.values()) {
+			if (entry.session !== session) continue;
+			entry.session = null;
+			// The peer has to go with it. A peer that already answered one offer ignores the next one
+			// (`if (offered) return`), so leaving it behind would eat every reconnect until it
+			// happened to fail on its own.
+			entry.peer?.close('its session ended');
+			entry.peer = null;
 		}
 		this.notify();
 	}
@@ -382,7 +396,7 @@ export class RiozeLinkHost implements SessionHost {
 			this.pairingCreatedAt = Date.now();
 			this.pairingFailures = 0;
 			this.log('info', 'the pairing phrase expired and was replaced');
-			void this.syncRooms();
+			void this.syncLinks();
 			this.notify();
 		}
 	}
@@ -402,7 +416,7 @@ export class RiozeLinkHost implements SessionHost {
 		this.pairingCreatedAt = Date.now();
 		this.pairingFailures = 0;
 		this.log('info', 'a new pairing phrase is up');
-		void this.syncRooms();
+		void this.syncLinks();
 		this.notify();
 	}
 
@@ -442,7 +456,7 @@ export class RiozeLinkHost implements SessionHost {
 			uptimeMs: Date.now() - this.startedAt,
 			connectedClients: this.readyClients(),
 			platform: `${process.platform} ${process.arch}`,
-			relay: this.relay,
+			signal: this.signalBase,
 			shares: sharesReply(this.config.folders).shares,
 			ankiEnabled: this.config.anki.enabled,
 			ai: {
@@ -454,14 +468,14 @@ export class RiozeLinkHost implements SessionHost {
 		};
 	}
 
-	relayUrl(): string {
-		return this.relay;
+	signalUrl(): string {
+		return this.signalBase;
 	}
 
-	/** How many of this host's rooms are sitting on the relay right now. */
-	anchoredRooms(): number {
+	/** How many of this host's ids are registered with the signaling server right now. */
+	anchoredLinks(): number {
 		let count = 0;
-		for (const entry of this.rooms.values()) if (entry.link.online) count += 1;
+		for (const entry of this.links.values()) if (entry.link.online) count += 1;
 		return count;
 	}
 

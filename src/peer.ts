@@ -6,7 +6,7 @@
  * host the moment it opens. Nothing about the RPC lives here; a link is just a pipe.
  */
 import { RTCPeerConnection, type RTCDataChannel } from 'werift';
-import type { SignalPayload } from './protocol.ts';
+import { answerPayload, candidatePayload, isOfferPayload, type SignalPayload } from './protocol.ts';
 
 export interface PeerLinkOptions {
 	/** `stun:` URLs, when the user configured any. Empty means host candidates only, which is
@@ -53,9 +53,10 @@ export function createPeerLink(options: PeerLinkOptions): PeerLink {
 
 	peer.onIceCandidate.subscribe((candidate) => {
 		if (closed) return;
-		const frame: SignalPayload = candidate
-			? { type: 'candidate', candidate: candidate.toJSON() }
-			: { type: 'candidate', candidate: null };
+		// Gathering's end is not announced. The peerjs library never sends a null candidate, and the
+		// public cloud is particular about payloads, so neither do we.
+		if (!candidate) return;
+		const frame: SignalPayload = candidatePayload(candidate.toJSON());
 		// The answer has to arrive before any candidate does. Gathering starts while the answer is
 		// still being built, and a browser that is handed a candidate before a remote description
 		// throws it away, so the frames wait here for one beat.
@@ -81,29 +82,27 @@ export function createPeerLink(options: PeerLinkOptions): PeerLink {
 	async function handleSignal(data: SignalPayload): Promise<void> {
 		if (closed) return;
 		try {
-			if (data.type === 'offer') {
+			if (isOfferPayload(data)) {
 				if (offered) return;
 				offered = true;
-				await peer.setRemoteDescription({ type: 'offer', sdp: data.sdp });
+				await peer.setRemoteDescription({ type: 'offer', sdp: data.sdp.sdp });
 				const answer = await peer.createAnswer();
 				await peer.setLocalDescription({ type: 'answer', sdp: answer.sdp });
-				options.send({ type: 'answer', sdp: answer.sdp });
+				options.send(answerPayload(answer.sdp ?? ''));
 				answerSent = true;
 				for (const frame of buffered) options.send(frame);
 				buffered.length = 0;
 				return;
 			}
-			if (data.type === 'candidate') {
-				if (!data.candidate) {
-					await peer.addIceCandidate(null);
-					return;
-				}
-				await peer.addIceCandidate({
-					candidate: data.candidate.candidate,
-					sdpMid: data.candidate.sdpMid,
-					sdpMLineIndex: data.candidate.sdpMLineIndex
-				});
+			if (!data.candidate) {
+				await peer.addIceCandidate(null);
+				return;
 			}
+			await peer.addIceCandidate({
+				candidate: data.candidate.candidate,
+				sdpMid: data.candidate.sdpMid,
+				sdpMLineIndex: data.candidate.sdpMLineIndex
+			});
 		} catch (error) {
 			options.log(`signaling failed: ${(error as Error).message}`);
 			closeOnce('the WebRTC handshake failed');

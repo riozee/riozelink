@@ -353,8 +353,8 @@ export interface StatusInfoReply {
 	/** How many proven clients this daemon is holding right now. The clients themselves are private. */
 	connectedClients: number;
 	platform: string;
-	/** The relay the host is parked on, so the client can say where the meeting point was. */
-	relay: string;
+	/** The signaling server the host is parked on, so the client can say where the meeting point was. */
+	signal: string;
 	shares: VfsShare[];
 	ankiEnabled: boolean;
 	ai: {
@@ -435,42 +435,147 @@ export function splitAction(action: RpcAction): { subsystem: RpcSubsystem; name:
 /* ------------------------------------------------------------------------------------------------
  * Signaling
  *
- * Before there is a DataChannel there has to be an introduction. Both ends dial out to the same
- * relay and join the same room; the relay forwards an SDP offer, an answer and ICE candidates and
- * forgets the room the moment it empties. Nothing secret rides here: a room name is a hash, the
- * DataChannel is encrypted by DTLS, and every session still has to pass the auth exchange above.
+ * Before there is a DataChannel there has to be an introduction. Both ends speak the PeerServer
+ * protocol, the signaling server the `peerjs` library uses: every peer dials out with an id, the
+ * server remembers who is where, and OFFER, ANSWER and CANDIDATE frames are forwarded to the id
+ * they are addressed to. Nothing secret rides here. An id is a hash, the DataChannel is encrypted
+ * by DTLS, and every session still has to pass the auth exchange above.
  *
- * The default relay is a Cloudflare Worker that ships next to this daemon (`relay/`). It can be
- * swapped for any other copy of the same tiny protocol with `--relay`, which is what running your
- * own relay means: one URL, no accounts, no build step.
+ * The default is the public PeerServer cloud. Running your own is one command (`npx peerjs`) and a
+ * different URL passed to `--signal`, because it is the same protocol. No TURN server is involved
+ * anywhere; see the README for what that costs.
+ *
+ * The payload shape below is not our invention. It is what the peerjs library puts on a data
+ * connection's offer, and the public cloud inspects it: a socket that sends anything else is closed
+ * on the spot. `sdp` is a whole description object, `type` says `data`, and an offer carries the
+ * connection's label and serialization. Speaking the library's dialect is the price of using a
+ * server we do not run, and a server we do run is happy with the same frames.
  * ---------------------------------------------------------------------------------------------- */
 
-export const DEFAULT_RELAY_URL = 'wss://relay.rioze.dev';
+/** The public PeerServer cloud, reached the way the peerjs library reaches it. */
+export const DEFAULT_SIGNAL_URL = 'wss://0.peerjs.com/peerjs';
 
-/** Which end of the room a socket is. Two sockets per room, one of each. */
-export type RelayRole = 'host' | 'client';
+/** PeerServer's default key. The cloud expects this one. */
+export const SIGNAL_KEY = 'peerjs';
 
-export type SignalPayload =
-	| { type: 'offer'; sdp: string }
-	| { type: 'answer'; sdp: string }
-	| {
-			type: 'candidate';
-			candidate: { candidate: string; sdpMid?: string; sdpMLineIndex?: number } | null;
-	  };
+/** Sent as `version`. The server only uses it to warn about mismatches. */
+export const SIGNAL_VERSION = '1.5.5';
+
+/** Everything the signaling server says, and everything we say to it. */
+export type SignalMessageType =
+	| 'OPEN'
+	| 'HEARTBEAT'
+	| 'OFFER'
+	| 'ANSWER'
+	| 'CANDIDATE'
+	| 'LEAVE'
+	| 'EXPIRE'
+	| 'ID-TAKEN'
+	| 'ERROR'
+	| 'INVALID-KEY';
+
+export interface SignalMessage {
+	type: SignalMessageType;
+	/** Who sent it. The server fills this in on everything it forwards. */
+	src?: string;
+	/** Who it is for. Both ends set this on OFFER, ANSWER, CANDIDATE and LEAVE. */
+	dst?: string;
+	payload?: SignalOffer | SignalCandidate | { msg?: string } | null;
+}
+
+/** What rides inside an OFFER or an ANSWER, in the shape the peerjs library uses. */
+export interface SignalOffer {
+	sdp: { type: 'offer' | 'answer'; sdp: string };
+	/** The connection kind. RiozeLink only ever opens data channels. */
+	type: 'data';
+	/** Filled in by the sender, to tell one attempt from the next inside one link. */
+	connectionId?: string;
+	label?: string;
+	reliable?: boolean;
+	serialization?: 'binary';
+}
+
+/** What rides inside a CANDIDATE. `candidate: null` means gathering is done. */
+export interface SignalCandidate {
+	candidate: {
+		candidate: string;
+		sdpMid?: string;
+		sdpMLineIndex?: number;
+		usernameFragment?: string | null;
+	} | null;
+	type: 'data';
+	connectionId?: string;
+}
+
+/** What the rest of the daemon cares about: descriptions and candidates, nothing else. */
+export type SignalPayload = SignalOffer | SignalCandidate;
 
 /**
- * What travels between a peer and the relay. Every message is small JSON; the relay reads `room`
- * once, at the join, and after that it only forwards `signal` frames to the other member.
+ * Tells a description from a candidate. The envelope's own type does the real work (`OFFER`,
+ * `ANSWER`, `CANDIDATE`), and this is for the payload-only paths.
  */
-export type RelayMessage =
-	| { t: 'join'; room: string; role: RelayRole; name?: string }
-	| { t: 'joined'; room: string; peers: number }
-	/** The other member arrived or left. Only ever sent after a `joined`. */
-	| { t: 'peer'; event: 'joined' | 'left' }
-	| { t: 'signal'; data: SignalPayload }
-	| { t: 'error'; reason: string; fatal?: boolean }
-	| { t: 'ping' }
-	| { t: 'pong' };
+export function isOfferPayload(payload: SignalPayload): payload is SignalOffer {
+	return 'sdp' in payload;
+}
+
+/**
+ * An offer, with every field the library sends on a data connection. The cloud checks for them, so
+ * they are filled in here rather than remembered at each call site.
+ */
+export function offerPayload(sdp: string, connectionId?: string): SignalOffer {
+	return {
+		sdp: { type: 'offer', sdp },
+		type: 'data',
+		connectionId,
+		label: 'rioze',
+		reliable: true,
+		serialization: 'binary'
+	};
+}
+
+/** The answer: the library sends these three fields, and the cloud accepts that. */
+export function answerPayload(sdp: string, connectionId?: string): SignalOffer {
+	return { sdp: { type: 'answer', sdp }, type: 'data', connectionId };
+}
+
+/** A gathered candidate. Gathering's end is not announced: the library never sends a null one. */
+export function candidatePayload(
+	candidate: NonNullable<SignalCandidate['candidate']>,
+	connectionId?: string
+): SignalCandidate {
+	return { candidate, type: 'data', connectionId };
+}
+
+/** A throwaway id for the browser's side of one link. Valid on any PeerServer. */
+export function makeSignalId(): string {
+	const bytes = crypto.getRandomValues(new Uint8Array(6));
+	const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+	return `rz-c-${hex}`;
+}
+
+/** 12 hex characters, to tell one link's frames from another's inside one socket. */
+export function makeConnectionId(): string {
+	const bytes = crypto.getRandomValues(new Uint8Array(6));
+	return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * The socket URL for one id.
+ *
+ * `wss://0.peerjs.com/peerjs?key=peerjs&id=…&token=…&version=…` is the shape the peerjs library
+ * builds, and every PeerServer, cloud or self-hosted, answers to it. A bare host gets the
+ * default `/peerjs` path appended, because that is what surprises people the first time.
+ */
+export function signalSocketUrl(base: string, id: string, token: string): string {
+	let url = base.trim().replace(/\/+$/, '');
+	if (!/^wss?:\/\//i.test(url)) url = `wss://${url}`;
+	try {
+		if (new URL(url).pathname === '/') url = `${url}/peerjs`;
+	} catch {
+		// Not a URL at all. Let the socket fail with its own message.
+	}
+	return `${url}?key=${SIGNAL_KEY}&id=${encodeURIComponent(id)}&token=${encodeURIComponent(token)}&version=${SIGNAL_VERSION}`;
+}
 
 /* ------------------------------------------------------------------------------------------------
  * Words, rooms and the pairing proof
@@ -525,23 +630,23 @@ export async function sha256Hex(text: string): Promise<string> {
 }
 
 /**
- * The pairing room: a hash of the phrase, so the relay never learns the words. Two processes can
+ * The pairing id: a hash of the phrase, so the signaling server never learns the words. Two ends can
  * only meet here if they were told the same phrase, and the phrase dies with the pairing window.
  */
-export function pairRoom(phrase: string): Promise<string> {
+export function pairId(phrase: string): Promise<string> {
 	return sha256Hex(`riozelink:pair:v1:${normalizePhrase(phrase)}`).then(
-		(hex) => `pair:${hex.slice(0, 32)}`
+		(hex) => `rz-pair-${hex.slice(0, 24)}`
 	);
 }
 
 /**
- * The room two already-paired ends meet in, named after both fingerprints. Nobody else can compute
+ * The id two already-paired ends meet under, named after both fingerprints. Nobody else can compute
  * it, which is why a reconnect needs no phrase, no address, and no attention from the user.
  */
-export function linkRoom(hostFingerprintHex: string, clientFingerprintHex: string): Promise<string> {
+export function linkId(hostFingerprintHex: string, clientFingerprintHex: string): Promise<string> {
 	return sha256Hex(
 		`riozelink:link:v1:${hostFingerprintHex.toLowerCase()}:${clientFingerprintHex.toLowerCase()}`
-	).then((hex) => `link:${hex.slice(0, 32)}`);
+	).then((hex) => `rz-link-${hex.slice(0, 24)}`);
 }
 
 /**
