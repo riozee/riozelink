@@ -397,14 +397,17 @@ export class ClientSession {
 			case 'chat': {
 				const streamId = requireString(payload.streamId, 'streamId');
 				this.aiStreams.add(streamId);
+				this.host.log('info', `ai chat ${streamId} started`);
 				const sink: AiStreamSink = {
 					chunk: (id: string, delta: string) => this.emit('ai', 'chunk', { streamId: id, delta }),
 					end: (id: string, text: string) => {
 						this.aiStreams.delete(id);
+						this.host.log('info', `ai chat ${id} finished (${text.length} chars)`);
 						this.emit('ai', 'end', { streamId: id, text });
 					},
 					error: (id: string, error: RpcErrorInfo) => {
 						this.aiStreams.delete(id);
+						this.host.log('warn', `ai chat ${id} failed: ${error.message}`);
 						this.emit('ai', 'error', { streamId: id, error });
 					}
 				};

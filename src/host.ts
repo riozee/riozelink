@@ -114,7 +114,8 @@ export class RiozeLinkHost implements SessionHost {
 		}
 		const hostServices = {
 			config: this.config,
-			save: () => this.save()
+			save: () => this.save(),
+			log: (message: string) => this.log('info', message)
 		};
 		this.anki = new AnkiService(hostServices);
 		this.ai = new AiService(hostServices);

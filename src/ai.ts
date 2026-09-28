@@ -23,6 +23,8 @@ import { maskKey, truncate } from './util.ts';
 export interface AiHost {
 	config: HostConfig;
 	save(): Promise<void>;
+	/** Optional; the daemon uses it to put stream edges on the terminal panel. */
+	log?(message: string): void;
 }
 
 export interface AiStreamSink {
@@ -113,6 +115,9 @@ export class AiService {
 		const ai = this.host.config.ai;
 		const controller = new AbortController();
 		this.controllers.set(streamId, controller);
+		this.host.log?.(
+			`ai chat ${streamId} -> ${ai.provider} ${ai.endpoint} (${payload.model ?? ai.model}, ${messages.length} messages)`
+		);
 
 		try {
 			if (ai.provider === 'ollama') {
