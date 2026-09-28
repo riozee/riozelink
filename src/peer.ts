@@ -36,6 +36,9 @@ export function createPeerLink(options: PeerLinkOptions): PeerLink {
 		maxMessageSize: 8 * 1024 * 1024
 	});
 	let closed = false;
+	/** Candidates gathered before the answer went out, waiting for their turn. */
+	const buffered = [] as SignalPayload[];
+	let answerSent = false;
 
 	function closeOnce(reason: string): void {
 		if (closed) return;
@@ -50,11 +53,17 @@ export function createPeerLink(options: PeerLinkOptions): PeerLink {
 
 	peer.onIceCandidate.subscribe((candidate) => {
 		if (closed) return;
-		if (!candidate) {
-			options.send({ type: 'candidate', candidate: null });
+		const frame: SignalPayload = candidate
+			? { type: 'candidate', candidate: candidate.toJSON() }
+			: { type: 'candidate', candidate: null };
+		// The answer has to arrive before any candidate does. Gathering starts while the answer is
+		// still being built, and a browser that is handed a candidate before a remote description
+		// throws it away, so the frames wait here for one beat.
+		if (!answerSent) {
+			buffered.push(frame);
 			return;
 		}
-		options.send({ type: 'candidate', candidate: candidate.toJSON() });
+		options.send(frame);
 	});
 
 	peer.connectionStateChange.subscribe((state) => {
@@ -79,6 +88,9 @@ export function createPeerLink(options: PeerLinkOptions): PeerLink {
 				const answer = await peer.createAnswer();
 				await peer.setLocalDescription({ type: 'answer', sdp: answer.sdp });
 				options.send({ type: 'answer', sdp: answer.sdp });
+				answerSent = true;
+				for (const frame of buffered) options.send(frame);
+				buffered.length = 0;
 				return;
 			}
 			if (data.type === 'candidate') {
