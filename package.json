@@ -1,6 +1,6 @@
 {
 	"name": "riozelink",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"description": "Bridge RiozeOS to your computer. Mount host folders as drives, reach AnkiConnect and route AI calls through local models or your own API keys, all over an encrypted WebRTC link.",
 	"type": "module",
 	"module": "src/index.ts",

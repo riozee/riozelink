@@ -8,7 +8,8 @@
  *
  * The order is fixed. `auth:hello` proves the host to the client by signing the client's nonce.
  * Then either `auth:prove` (a returning client signs the host's nonce) or `auth:pair` (the same,
- * plus the code the host printed). Only after that does any other subsystem answer.
+ * plus an HMAC over the nonce made with the four words the host printed). Only after that does any
+ * other subsystem answer.
  */
 import type { RTCDataChannel } from 'werift';
 import type { AnkiService } from './anki.ts';
@@ -42,11 +43,13 @@ export interface SessionHost {
 	/** Hands an event to every ready session. */
 	broadcastEvent(subsystem: RpcSubsystem, action: string, payload: unknown): void;
 	clientsChanged(): void;
-	verifyPairingCode(code: string): boolean;
-	consumePairingCode(): void;
+	verifyPairingProof(proof: string, hostNonce: string): Promise<boolean>;
+	consumePairingPhrase(): void;
 	pairingFailed(): void;
 	createShare(absPath: string, label: string): Promise<{ id: string; share: ShareRecord }>;
 	removeShare(id: string): Promise<void>;
+	/** Asks the host to re-probe Anki right now, so a toggle answers with fresh truth. */
+	ankiChanged(): Promise<void>;
 	sessionClosed(session: ClientSession): void;
 	readonly ai: AiService;
 	readonly anki: AnkiService;
@@ -71,8 +74,8 @@ export class ClientSession {
 	clientName = 'Browser';
 	clientLabel = '';
 	fingerprint = '';
-	/** How this client arrived: through the pairing code, or straight to the host room. */
-	readonly origin: 'pair' | 'host';
+	/** How this client arrived: through the pairing phrase, or straight into its own link room. */
+	readonly origin: 'pair' | 'link';
 
 	private clientPublicKey = '';
 	private hostNonce = '';
@@ -85,7 +88,7 @@ export class ClientSession {
 	constructor(
 		private readonly channel: RTCDataChannel,
 		private readonly host: SessionHost,
-		origin: 'pair' | 'host',
+		origin: 'pair' | 'link',
 		peerLabel?: string
 	) {
 		this.origin = origin;
@@ -272,16 +275,19 @@ export class ClientSession {
 			throw new HostError('this client is already known. Reconnect instead.', 'invalid');
 		}
 		const signature = requireString(payload.signature, 'signature');
-		const code = requireString(payload.code, 'code');
+		const proof = requireString(payload.proof, 'proof');
 		const name = cleanName(payload.clientName ?? this.clientName);
 
-		// Both checks always run, so a wrong code and a wrong key take the same time and answer
+		// Both checks always run, so a wrong phrase and a wrong key take the same time and answer
 		// with the same words.
 		const signatureOk = await this.verifyClientProof(signature);
-		const codeOk = this.host.verifyPairingCode(code);
-		if (!signatureOk || !codeOk) {
+		const phraseOk = await this.host.verifyPairingProof(proof, this.hostNonce);
+		if (!signatureOk || !phraseOk) {
 			this.host.pairingFailed();
-			throw new HostError('pairing failed. Check the code in the terminal and try again.', 'auth');
+			throw new HostError(
+				'pairing failed. Check the four words on the host and try again.',
+				'auth'
+			);
 		}
 
 		this.clientName = name;
@@ -290,7 +296,7 @@ export class ClientSession {
 			pairedAt: Date.now()
 		};
 		await this.host.save();
-		this.host.consumePairingCode();
+		this.host.consumePairingPhrase();
 		this.host.log('info', `paired with ${name} (${this.fingerprint})`);
 		return this.becomeReady(name);
 	}
@@ -373,10 +379,14 @@ export class ClientSession {
 		switch (action) {
 			case 'status':
 				return this.host.anki.status();
-			case 'set-enabled':
-				return this.host.anki.setEnabled(payload.enabled === true);
+			case 'set-enabled': {
+				const status = await this.host.anki.setEnabled(payload.enabled === true);
+				void this.host.ankiChanged();
+				return status;
+			}
 			case 'invoke':
-				return this.host.anki.invoke(payload);			default:
+				return this.host.anki.invoke(payload);
+			default:
 				throw new HostError(`unknown anki action: ${action}`, 'unsupported');
 		}
 	}
@@ -395,6 +405,11 @@ export class ClientSession {
 			case 'clear-key':
 				return this.host.ai.clearKey();
 			case 'chat': {
+				// Refuse before anything starts, so a turned-off gateway answers with an error
+				// rather than a stream that dies on its first event.
+				if (!this.host.config.ai.enabled) {
+					throw new HostError('the AI gateway is turned off in riozelink', 'denied');
+				}
 				const streamId = requireString(payload.streamId, 'streamId');
 				this.aiStreams.add(streamId);
 				this.host.log('info', `ai chat ${streamId} started`);

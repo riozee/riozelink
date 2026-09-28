@@ -74,6 +74,10 @@ export const VFS_CHUNK = 45 * 1024;
  * The client generates an ECDSA P-256 key pair (non-extractable private key, stored in the
  * browser). The host has one too. Hello proves the host, proof and pairing prove the client.
  * Everything is WebCrypto on both sides, so the signature formats match exactly.
+ *
+ * Pairing also has to prove that the person typing knows the four words. That proof is an HMAC,
+ * not a signature: the phrase is stretched with PBKDF2 first (see {@link derivePairingKey}), and
+ * the code the host generated is never sent back over the wire in any form.
  * ---------------------------------------------------------------------------------------------- */
 
 export interface AuthHelloPayload {
@@ -111,9 +115,10 @@ export interface AuthProvePayload {
 	signature: string;
 }
 
-/** A first-time client pairs with the code the host prints. */
+/** A first-time client pairs with the phrase the host prints. */
 export interface AuthPairPayload {
-	code: string;
+	/** Base64 HMAC of the host nonce, keyed by the phrase. See {@link pairProof}. */
+	proof: string;
 	/** ECDSA signature over the host nonce, so the key being stored is the key being used. */
 	signature: string;
 	clientName: string;
@@ -282,6 +287,8 @@ export interface AiMessage {
 }
 
 export interface AiStatusReply {
+	/** The user's toggle. Off means the gateway refuses to send anything. */
+	enabled: boolean;
 	provider: AiProvider;
 	endpoint: string;
 	model: string;
@@ -296,6 +303,7 @@ export interface AiStatusReply {
 }
 
 export interface AiConfigRequest {
+	enabled?: boolean;
 	provider?: AiProvider;
 	endpoint?: string;
 	model?: string;
@@ -345,9 +353,12 @@ export interface StatusInfoReply {
 	/** How many proven clients this daemon is holding right now. The clients themselves are private. */
 	connectedClients: number;
 	platform: string;
+	/** The relay the host is parked on, so the client can say where the meeting point was. */
+	relay: string;
 	shares: VfsShare[];
 	ankiEnabled: boolean;
 	ai: {
+		enabled: boolean;
 		provider: AiProvider;
 		model: string;
 		keySet: boolean;
@@ -406,6 +417,7 @@ export type RpcResult<A extends RpcAction> = RpcSpec[A]['reply'];
 export interface RpcEvents {
 	'vfs:changed': VfsChangedEvent;
 	'vfs:shares': VfsSharesReply;
+	'anki:status': AnkiStatusReply;
 	'ai:chunk': AiChunkEvent;
 	'ai:end': AiEndEvent;
 	'ai:error': AiStreamErrorEvent;
@@ -423,41 +435,144 @@ export function splitAction(action: RpcAction): { subsystem: RpcSubsystem; name:
 /* ------------------------------------------------------------------------------------------------
  * Signaling
  *
- * Before there is a DataChannel there has to be an introduction. The daemon runs a small WebSocket
- * server; the client joins a room and the two swap an SDP offer, an answer and ICE candidates.
- * Nothing secret rides here. The DataChannel is encrypted by DTLS and every session still has to
- * pass the auth exchange above, so the signaling server can only ever carry introductions.
+ * Before there is a DataChannel there has to be an introduction. Both ends dial out to the same
+ * relay and join the same room; the relay forwards an SDP offer, an answer and ICE candidates and
+ * forgets the room the moment it empties. Nothing secret rides here: a room name is a hash, the
+ * DataChannel is encrypted by DTLS, and every session still has to pass the auth exchange above.
+ *
+ * The default relay is a Cloudflare Worker that ships next to this daemon (`relay/`). It can be
+ * swapped for any other copy of the same tiny protocol with `--relay`, which is what running your
+ * own relay means: one URL, no accounts, no build step.
  * ---------------------------------------------------------------------------------------------- */
 
-export type SignalMessage =
+export const DEFAULT_RELAY_URL = 'wss://relay.rioze.dev';
+
+/** Which end of the room a socket is. Two sockets per room, one of each. */
+export type RelayRole = 'host' | 'client';
+
+export type SignalPayload =
+	| { type: 'offer'; sdp: string }
+	| { type: 'answer'; sdp: string }
 	| {
-			t: 'join';
-			/** `pair:<code>` for a first pairing, `host:<fingerprint>` for a returning client. */
-			room: string;
-			role: 'client';
-			name?: string;
-	  }
-	| { t: 'joined'; room: string; host: { name: string; version: string; fingerprint: string } }
-	| {
-			t: 'signal';
-			data:
-				| { type: 'offer'; sdp: string }
-				| { type: 'answer'; sdp: string }
-				| { type: 'candidate'; candidate: { candidate: string; sdpMid?: string; sdpMLineIndex?: number } | null };
-	  }
-	| { t: 'error'; reason: string }
+			type: 'candidate';
+			candidate: { candidate: string; sdpMid?: string; sdpMLineIndex?: number } | null;
+	  };
+
+/**
+ * What travels between a peer and the relay. Every message is small JSON; the relay reads `room`
+ * once, at the join, and after that it only forwards `signal` frames to the other member.
+ */
+export type RelayMessage =
+	| { t: 'join'; room: string; role: RelayRole; name?: string }
+	| { t: 'joined'; room: string; peers: number }
+	/** The other member arrived or left. Only ever sent after a `joined`. */
+	| { t: 'peer'; event: 'joined' | 'left' }
+	| { t: 'signal'; data: SignalPayload }
+	| { t: 'error'; reason: string; fatal?: boolean }
 	| { t: 'ping' }
 	| { t: 'pong' };
 
-/** Just the payload of a `signal` frame — an offer, an answer, or one ICE candidate. */
-export type SignalPayload = Extract<SignalMessage, { t: 'signal' }>['data'];
+/* ------------------------------------------------------------------------------------------------
+ * Words, rooms and the pairing proof
+ *
+ * One phrase does three jobs: a person reads it off the host's terminal, it names the room on the
+ * relay, and it is the secret that proves the person was at that terminal. It is never sent
+ * anywhere. Both sides hash it into a room name and stretch it into an HMAC key, so the relay
+ * only ever sees the hash and the host only ever sees the proof.
+ * ---------------------------------------------------------------------------------------------- */
 
-/** The room name a returning client joins. */
-export function hostRoom(fingerprintHex: string): string {
-	return `host:${fingerprintHex}`;
+/** PBKDF2 rounds. Slow enough to make a phrase list painful to walk, fast enough to feel instant. */
+export const PAIR_KDF_ITERATIONS = 100_000;
+
+/** Keeps the key bound to this protocol version and this job. */
+export const PAIR_KDF_SALT = 'riozelink:pair:v1';
+
+declare const btoa: (data: string) => string;
+declare const atob: (data: string) => string;
+
+function bytesToBase64(bytes: Uint8Array): string {
+	let binary = '';
+	for (const byte of bytes) binary += String.fromCharCode(byte);
+	return btoa(binary);
 }
 
-/** The room name a first-time pairing uses. */
-export function pairRoom(code: string): string {
-	return `pair:${code.replaceAll(/[\s-]/g, '').toUpperCase()}`;
+function base64ToBytes(text: string): Uint8Array<ArrayBuffer> {
+	const binary = atob(text);
+	const bytes = new Uint8Array(new ArrayBuffer(binary.length));
+	for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+	return bytes;
+}
+
+/** The one spelling of a phrase both ends agree on: lowercase words, single dashes. */
+export function normalizePhrase(input: string): string {
+	return input
+		.toLowerCase()
+		.replaceAll(/[^a-z]+/g, '-')
+		.replaceAll(/^-+|-+$/g, '');
+}
+
+/** Three to six words. Shorter is a typo, longer is a paste accident. */
+export function isPhraseShaped(phrase: string): boolean {
+	const normalized = normalizePhrase(phrase);
+	if (!normalized) return false;
+	const words = normalized.split('-');
+	return words.length >= 3 && words.length <= 6;
+}
+
+export async function sha256Hex(text: string): Promise<string> {
+	const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+	return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * The pairing room: a hash of the phrase, so the relay never learns the words. Two processes can
+ * only meet here if they were told the same phrase, and the phrase dies with the pairing window.
+ */
+export function pairRoom(phrase: string): Promise<string> {
+	return sha256Hex(`riozelink:pair:v1:${normalizePhrase(phrase)}`).then(
+		(hex) => `pair:${hex.slice(0, 32)}`
+	);
+}
+
+/**
+ * The room two already-paired ends meet in, named after both fingerprints. Nobody else can compute
+ * it, which is why a reconnect needs no phrase, no address, and no attention from the user.
+ */
+export function linkRoom(hostFingerprintHex: string, clientFingerprintHex: string): Promise<string> {
+	return sha256Hex(
+		`riozelink:link:v1:${hostFingerprintHex.toLowerCase()}:${clientFingerprintHex.toLowerCase()}`
+	).then((hex) => `link:${hex.slice(0, 32)}`);
+}
+
+/**
+ * PBKDF2(phrase) → a non-extractable HMAC key. The host derives the same key from the phrase it
+ * generated; neither side ever compares phrases, only proofs.
+ */
+export async function derivePairingKey(phrase: string): Promise<CryptoKey> {
+	const material = await crypto.subtle.importKey(
+		'raw',
+		new TextEncoder().encode(normalizePhrase(phrase)),
+		'PBKDF2',
+		false,
+		['deriveKey']
+	);
+	return crypto.subtle.deriveKey(
+		{
+			name: 'PBKDF2',
+			salt: new TextEncoder().encode(PAIR_KDF_SALT),
+			iterations: PAIR_KDF_ITERATIONS,
+			hash: 'SHA-256'
+		},
+		material,
+		{ name: 'HMAC', hash: 'SHA-256', length: 256 },
+		false,
+		['sign']
+	);
+}
+
+/** Base64 HMAC of the host nonce — one fresh proof per handshake, derived from the words. */
+export async function pairProof(phrase: string, hostNonce: string): Promise<string> {
+	const key = await derivePairingKey(phrase);
+	const signature = await crypto.subtle.sign('HMAC', key, base64ToBytes(hostNonce));
+	return bytesToBase64(new Uint8Array(signature));
 }

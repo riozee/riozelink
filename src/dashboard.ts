@@ -1,9 +1,9 @@
 /**
  * The terminal face of the daemon.
  *
- * On a TTY it paints a small live panel: where to point RiozeOS, the code it will ask for, who is
- * connected, which folders are shared, and the last few things that happened. `n` replaces the
- * code, `h` explains the first connection, `q` stops the daemon.
+ * On a TTY it paints a small live panel: the four words RiozeOS will ask for, the relay both ends
+ * meet on, who is connected, which folders are shared, and the last few things that happened.
+ * `n` rolls a new phrase, `h` explains the first connection, `q` stops the daemon.
  *
  * Without a TTY (a service manager, a pipe, CI) it prints the panel once and then one line per
  * event, which is what a log file wants.
@@ -88,7 +88,7 @@ export class Dashboard {
 			return;
 		}
 		if (key === 'n') {
-			this.host.rotatePairingCode();
+			this.host.rotatePairing();
 			return;
 		}
 		if (key === 'h') {
@@ -137,9 +137,9 @@ export class Dashboard {
 		lines.push(
 			`${this.paint(`RIozeLink ${host.hostVersion}`, 'bold')} ${this.paint('· listening', 'green')}`
 		);
-		lines.push(`${this.paint('address  ', 'dim')} ${this.paint(host.address(), 'cyan')}`);
+		lines.push(`${this.paint('relay    ', 'dim')} ${this.paint(host.relayUrl(), 'dim')}`);
 		lines.push(
-			`${this.paint('code     ', 'dim')} ${this.paint(host.currentPairingCode(), 'bold')} ` +
+			`${this.paint('words    ', 'dim')} ${this.paint(host.currentPairingPhrase(), 'bold')} ` +
 				this.paint(`(${host.pairingRemainingLabel()} left)`, 'dim')
 		);
 		lines.push(`${this.paint('clients  ', 'dim')} ${state}`);
@@ -155,10 +155,10 @@ export class Dashboard {
 
 		if (this.help) {
 			lines.push(this.paint('how to connect', 'bold'));
-			lines.push(`  1. open riozeOS and start the RiozeLink app`);
-			lines.push(`  2. paste the address and the code, or the whole pair link`);
-			lines.push(`     ${truncate(host.pairingLink(), 96)}`);
-			lines.push(`  3. the code retires itself the moment a client pairs`);
+			lines.push(`  1. open riozeOS, start the RiozeLink app, and type the four words above`);
+			lines.push(`     nobody who cannot read this terminal can pair, and the words retire`);
+			lines.push(`     the moment a browser uses them`);
+			lines.push(`  2. the browser remembers this computer, so the next visit needs no words`);
 			lines.push('');
 		}
 
@@ -169,7 +169,7 @@ export class Dashboard {
 
 		if (this.tty) {
 			lines.push('');
-			lines.push(this.paint('[n] new code   [h] help   [q] quit', 'dim'));
+			lines.push(this.paint('[n] new words   [h] help   [q] quit', 'dim'));
 		}
 		return lines;
 	}

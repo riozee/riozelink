@@ -1,20 +1,24 @@
 /**
- * Test-side pieces: a minimal RiozeOS client and two fake services.
+ * Test-side pieces: a minimal RiozeOS client, a real relay, and two fake services.
  *
  * The client speaks the same protocol the browser app does, with werift standing in for the
  * browser's WebRTC. That is the point of the exercise: if the daemon satisfies this, it will
  * satisfy the real client, because both sides only ever meet at `protocol.ts`.
  */
 import { RTCPeerConnection, type RTCDataChannel } from 'werift';
+import { fingerprintOfPublicKey } from '../src/identity.ts';
 import {
 	PROTOCOL_VERSION,
-	hostRoom,
+	linkRoom,
+	pairProof,
 	pairRoom,
 	type AuthHelloReply,
 	type AuthOkPayload,
+	type RelayMessage,
 	type RpcWire,
-	type SignalMessage
+	type SignalPayload
 } from '../src/protocol.ts';
+import { createRelayServer, type RelayServer } from '../src/relay-server.ts';
 import { fromBase64, randomNonce, toBase64 } from '../src/util.ts';
 
 const KEY_PARAMS: EcKeyGenParams = { name: 'ECDSA', namedCurve: 'P-256' };
@@ -22,6 +26,12 @@ const SIGN_PARAMS: EcdsaParams = { name: 'ECDSA', hash: 'SHA-256' };
 
 const CHANNEL_TIMEOUT_MS = 20000;
 const CALL_TIMEOUT_MS = 20000;
+
+/** A relay of the tests' own, on a loopback port nothing else is using. */
+export async function startTestRelay(): Promise<{ url: string; server: RelayServer }> {
+	const server = await createRelayServer({ port: 0, host: '127.0.0.1' });
+	return { url: `ws://127.0.0.1:${server.port}`, server };
+}
 
 export function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
 	return new Promise<T>((resolve, reject) => {
@@ -47,7 +57,7 @@ export interface TestEvent {
 
 export class TestClient {
 	static async connect(
-		address: string,
+		relayUrl: string,
 		room: string,
 		options: { name?: string; keyPair?: CryptoKeyPair } = {}
 	): Promise<TestClient> {
@@ -64,26 +74,29 @@ export class TestClient {
 			client.onText(typeof data === 'string' ? data : data.toString('utf8'));
 		});
 
-		const socket = new WebSocket(address);
+		const socket = new WebSocket(relayUrl);
 		client.socket = socket;
 		await new Promise<void>((resolve, reject) => {
-			const timer = setTimeout(() => reject(new Error('the signaling socket did not open')), 8000);
+			const timer = setTimeout(() => reject(new Error('the relay socket did not open')), 8000);
 			socket.onopen = () => {
 				clearTimeout(timer);
 				resolve();
 			};
 			socket.onerror = () => {
 				clearTimeout(timer);
-				reject(new Error('the signaling socket failed'));
+				reject(new Error('the relay socket failed'));
 			};
 		});
 
-		const joined = new Promise<void>((resolve, reject) => {
+		const joined = new Promise<number>((resolve, reject) => {
 			const timer = setTimeout(() => reject(new Error('the room never answered')), 8000);
 			client.onSignal = (message) => {
 				if (message.t === 'joined') {
 					clearTimeout(timer);
-					resolve();
+					resolve(message.peers);
+				}
+				if (message.t === 'peer' && message.event === 'joined') {
+					client.onPeerJoined?.();
 				}
 				if (message.t === 'error') {
 					clearTimeout(timer);
@@ -91,13 +104,13 @@ export class TestClient {
 				}
 			};
 			socket.onmessage = (event) => {
-				const message = JSON.parse(String(event.data)) as SignalMessage;
+				const message = JSON.parse(String(event.data)) as RelayMessage;
 				if (message.t === 'signal') void client.onRemoteSignal(message.data);
 				else client.onSignal?.(message);
 			};
 		});
 		socket.send(JSON.stringify({ t: 'join', room, role: 'client', name: client.name }));
-		await joined;
+		const peers = await joined;
 
 		client.peer.onIceCandidate.subscribe((candidate) => {
 			client.send({
@@ -105,9 +118,26 @@ export class TestClient {
 				data: { type: 'candidate', candidate: candidate ? candidate.toJSON() : null }
 			});
 		});
-		const offer = await client.peer.createOffer();
-		await client.peer.setLocalDescription({ type: 'offer', sdp: offer.sdp });
-		client.send({ t: 'signal', data: { type: 'offer', sdp: offer.sdp } });
+
+		// The daemon may still be dialing its own side of the room. Offering into an empty room
+		// would be offering to nobody, so the offer waits for the other member to arrive instead.
+		const offer = async (): Promise<void> => {
+			const description = await client.peer.createOffer();
+			await client.peer.setLocalDescription({ type: 'offer', sdp: description.sdp });
+			client.send({ t: 'signal', data: { type: 'offer', sdp: description.sdp } });
+		};
+		if (peers > 0) {
+			await offer();
+		} else {
+			await withTimeout(
+				new Promise<void>((resolve) => {
+					client.onPeerJoined = resolve;
+				}),
+				8000,
+				'the host to join the room'
+			);
+			await offer();
+		}
 
 		await withTimeout(
 			new Promise<void>((resolve) => {
@@ -130,7 +160,8 @@ export class TestClient {
 	private peer!: RTCPeerConnection;
 	private channel!: RTCDataChannel;
 	private socket!: WebSocket;
-	private onSignal: ((message: SignalMessage) => void) | null = null;
+	private onSignal: ((message: RelayMessage) => void) | null = null;
+	private onPeerJoined: (() => void) | null = null;
 	private readonly pending = new Map<string, (message: RpcWire & { kind: 'res' }) => void>();
 	private readonly waiters: Array<{
 		action: string;
@@ -139,11 +170,11 @@ export class TestClient {
 	}> = [];
 	private seq = 0;
 
-	private send(message: SignalMessage): void {
+	private send(message: RelayMessage): void {
 		this.socket.send(JSON.stringify(message));
 	}
 
-	private async onRemoteSignal(data: Extract<SignalMessage, { t: 'signal' }>['data']): Promise<void> {
+	private async onRemoteSignal(data: SignalPayload): Promise<void> {
 		if (data.type === 'answer') {
 			await this.peer.setRemoteDescription({ type: 'answer', sdp: data.sdp });
 			return;
@@ -260,14 +291,21 @@ export class TestClient {
 		return reply;
 	}
 
-	async pair(code: string): Promise<AuthOkPayload> {
+	/** The exact body a pairing request carries. Tests use it to send a wrong proof on purpose. */
+	async pairPayload(
+		phrase: string
+	): Promise<{ proof: string; signature: string; clientName: string }> {
 		if (!this.helloReply) await this.hello();
-		const signature = await this.sign(fromBase64(this.helloReply!.hostNonce));
-		return (await this.call('auth', 'pair', {
-			code,
-			signature,
+		const hostNonce = this.helloReply!.hostNonce;
+		return {
+			proof: await pairProof(phrase, hostNonce),
+			signature: await this.sign(fromBase64(hostNonce)),
 			clientName: this.name
-		})) as AuthOkPayload;
+		};
+	}
+
+	async pair(phrase: string): Promise<AuthOkPayload> {
+		return (await this.call('auth', 'pair', await this.pairPayload(phrase))) as AuthOkPayload;
 	}
 
 	async prove(): Promise<AuthOkPayload> {
@@ -276,9 +314,12 @@ export class TestClient {
 		return (await this.call('auth', 'prove', { signature })) as AuthOkPayload;
 	}
 
-	roomForReconnect(): string {
+	/** The room this client and the host meet in after pairing. No words needed, ever again. */
+	async roomForReconnect(): Promise<string> {
 		if (!this.helloReply) throw new Error('hello first');
-		return hostRoom(this.helloReply.fingerprint.replaceAll(' ', ''));
+		const hostHex = fingerprintOfPublicKey(this.helloReply.publicKey).fingerprintHex;
+		const ownHex = fingerprintOfPublicKey(this.publicKey).fingerprintHex;
+		return linkRoom(hostHex, ownHex);
 	}
 
 	close(): void {

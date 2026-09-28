@@ -45,9 +45,10 @@ export class AiService {
 	constructor(private readonly host: AiHost) {}
 
 	async status(): Promise<AiStatusReply> {
-		const { provider, endpoint, model, apiKey } = this.host.config.ai;
+		const { enabled, provider, endpoint, model, apiKey } = this.host.config.ai;
 		const probe = await this.probe(provider, endpoint, apiKey);
 		return {
+			enabled,
 			provider,
 			endpoint,
 			model,
@@ -58,8 +59,14 @@ export class AiService {
 		};
 	}
 
-	async setConfig(patch: { provider?: unknown; endpoint?: unknown; model?: unknown }): Promise<AiStatusReply> {
+	async setConfig(patch: {
+		enabled?: unknown;
+		provider?: unknown;
+		endpoint?: unknown;
+		model?: unknown;
+	}): Promise<AiStatusReply> {
 		const ai = this.host.config.ai;
+		if (typeof patch.enabled === 'boolean') ai.enabled = patch.enabled;
 		if (patch.provider === 'ollama' || patch.provider === 'openai') {
 			if (patch.provider !== ai.provider) {
 				ai.provider = patch.provider;
@@ -113,6 +120,9 @@ export class AiService {
 		const streamId = requireString(payload.streamId, 'streamId');
 		const messages = this.readMessages(payload.messages);
 		const ai = this.host.config.ai;
+		if (!ai.enabled) {
+			throw new HostError('the AI gateway is turned off in riozelink', 'denied');
+		}
 		const controller = new AbortController();
 		this.controllers.set(streamId, controller);
 		this.host.log?.(

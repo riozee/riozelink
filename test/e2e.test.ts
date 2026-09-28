@@ -1,10 +1,10 @@
 /**
- * End to end: a real daemon, a real WebRTC handshake, a real config file.
+ * End to end: a real daemon, a real relay, a real WebRTC handshake, a real config file.
  *
  * Everything the client does here travels the same path the browser app will take: a WebSocket
- * join, an SDP exchange, a DataChannel, the auth exchange, then RPC. Only the peer implementation
- * differs (werift instead of the browser stack), which is exactly the part `protocol.ts` does not
- * care about.
+ * join to the relay, an SDP exchange, a DataChannel, the auth exchange, then RPC. Only the peer
+ * implementation differs (werift instead of the browser stack), which is exactly the part
+ * `protocol.ts` does not care about.
  */
 import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
@@ -12,15 +12,35 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { loadConfig } from '../src/config.ts';
 import { RiozeLinkHost } from '../src/host.ts';
-import { VFS_CHUNK, type AuthOkPayload, type StatusInfoReply, type VfsShare } from '../src/protocol.ts';
+import {
+	VFS_CHUNK,
+	pairRoom,
+	type AuthOkPayload,
+	type StatusInfoReply,
+	type VfsShare
+} from '../src/protocol.ts';
+import type { RelayServer } from '../src/relay-server.ts';
 import { randomBytes, toBase64 } from '../src/util.ts';
-import { TestClient, mockAnki, mockOllama, pairRoom, withTimeout } from './support.ts';
+import { TestClient, mockAnki, mockOllama, startTestRelay, withTimeout } from './support.ts';
 
 const TEST_TIMEOUT = 30000;
+
+async function waitFor(predicate: () => boolean, what: string, timeoutMs = 8000): Promise<void> {
+	await withTimeout(
+		new Promise<void>((resolve) => {
+			const check = () => (predicate() ? resolve() : setTimeout(check, 50));
+			check();
+		}),
+		timeoutMs,
+		what
+	);
+}
 
 let root: string;
 let shareDir: string;
 let host: RiozeLinkHost;
+let relayUrl: string;
+let relay: RelayServer;
 let anki: { port: number; stop(): void };
 let ollama: { port: number; stop(): void };
 let primary: TestClient;
@@ -34,11 +54,13 @@ beforeAll(async () => {
 	await writeFile(path.join(shareDir, 'sub', 'nested.txt'), 'nested');
 	anki = mockAnki();
 	ollama = mockOllama();
+	const started = await startTestRelay();
+	relayUrl = started.url;
+	relay = started.server;
 
 	host = await RiozeLinkHost.create({
 		configDir: path.join(root, 'config'),
-		port: 0,
-		host: '127.0.0.1'
+		relay: relayUrl
 	});
 	host.config.anki.port = anki.port;
 	host.config.ai.provider = 'ollama';
@@ -51,19 +73,22 @@ beforeAll(async () => {
 afterAll(async () => {
 	primary?.close();
 	await host.stop('the test finished');
+	await relay.close();
 	anki.stop();
 	ollama.stop();
 	await rm(root, { recursive: true, force: true });
 });
 
-function address(): string {
-	return `ws://127.0.0.1:${host.port}`;
-}
-
 test(
-	'a first client pairs with the code and reads the host status',
+	'one phrase names one room, however it is typed',
 	async () => {
-		primary = await TestClient.connect(address(), pairRoom(host.currentPairingCode()), {
+		expect(await pairRoom('amber-cobalt-summit-drift')).toBe(
+			await pairRoom('  Amber Cobalt-Summit_drift  ')
+		);
+		const phrase = host.currentPairingPhrase();
+		expect(phrase.split('-').length).toBe(4);
+			await waitFor(() => host.anchoredRooms() >= 1, 'the host to reach the relay');
+		primary = await TestClient.connect(relayUrl, await pairRoom(phrase), {
 			name: 'Test Browser'
 		});
 		const hello = await primary.hello();
@@ -71,11 +96,12 @@ test(
 		expect(hello.known).toBe(false);
 		expect(hello.fingerprint.length).toBeGreaterThan(20);
 
-		primaryAuth = await primary.pair(host.currentPairingCode());
+		primaryAuth = await primary.pair(phrase);
 		expect(primaryAuth.clientLabel).toBe('Test Browser');
 
 		const status = (await primary.call('status', 'info')) as StatusInfoReply;
 		expect(status.connectedClients).toBe(1);
+		expect(status.relay).toBe(relayUrl);
 		expect(status.shares.length).toBe(1);
 		const share = status.shares[0] as VfsShare;
 		expect(share.id).toBe('notes');
@@ -88,9 +114,9 @@ test(
 );
 
 test(
-	'a returning client proves its key instead of asking for a code',
+	'a returning client proves its key instead of asking for words',
 	async () => {
-		const returning = await TestClient.connect(address(), primary.roomForReconnect(), {
+		const returning = await TestClient.connect(relayUrl, await primary.roomForReconnect(), {
 			name: 'Test Browser',
 			keyPair: primary.keyPair
 		});
@@ -259,11 +285,26 @@ test(
 );
 
 test(
-	'the AI gateway streams through the endpoint and only ever sends back a masked key',
+	'the AI gateway is off until asked, then streams and only ever sends back a masked key',
 	async () => {
-		const before = (await primary.call('ai', 'status')) as { keySet: boolean; keyMasked: string | null };
+		const before = (await primary.call('ai', 'status')) as {
+			enabled: boolean;
+			keySet: boolean;
+			keyMasked: string | null;
+		};
+		expect(before.enabled).toBe(false);
 		expect(before.keySet).toBe(false);
 		expect(before.keyMasked).toBeNull();
+
+		// Off really means off: a chat does not reach the endpoint at all.
+		const refused = await primary.expectFailure('ai', 'chat', {
+			streamId: 'stream-off',
+			messages: [{ role: 'user', content: 'hello?' }]
+		});
+		expect(refused.code).toBe('denied');
+
+		const enabled = (await primary.call('ai', 'config', { enabled: true })) as { enabled: boolean };
+		expect(enabled.enabled).toBe(true);
 
 		const key = 'sk-secret-abcdef1234';
 		const withKey = (await primary.call('ai', 'set-key', { key })) as {
@@ -326,14 +367,16 @@ test(
 );
 
 test(
-	'a second client pairs with a fresh code, and both see the aggregate count',
+	'a second client pairs with fresh words, and both see the aggregate count',
 	async () => {
-		const code = host.currentPairingCode();
-		const second = await TestClient.connect(address(), pairRoom(code), { name: 'Second Window' });
+		const phrase = host.currentPairingPhrase();
+		const second = await TestClient.connect(relayUrl, await pairRoom(phrase), {
+			name: 'Second Window'
+		});
 		try {
 			const hello = await second.hello();
 			expect(hello.known).toBe(false);
-			const auth = await second.pair(code);
+			const auth = await second.pair(phrase);
 			expect(auth.clientLabel).toBe('Second Window');
 			expect(host.readyClients()).toBe(2);
 
@@ -348,21 +391,23 @@ test(
 			second.close();
 		}
 
-		// The used code is retired, so it cannot pair a third client. The third client still joins
-		// the transport; the auth exchange is what turns it away.
-		const stale = await TestClient.connect(address(), primary.roomForReconnect(), {
-			name: 'Late Window'
-		});
+		// The used words are retired. Someone who found the room but not the words is turned away,
+		// which is exactly what the proof and the failure limit are for.
+		const impostor = await TestClient.connect(
+			relayUrl,
+			await pairRoom(host.currentPairingPhrase()),
+			{ name: 'Impostor' }
+		);
 		try {
-			await stale.hello();
-			const failure = await stale.expectFailure('auth', 'pair', {
-				code,
-				signature: 'AAAA',
-				clientName: 'Late Window'
-			});
+			await impostor.hello();
+			const failure = await impostor.expectFailure(
+				'auth',
+				'pair',
+				await impostor.pairPayload('definitely-not-the-four-words')
+			);
 			expect(failure.code).toBe('auth');
 		} finally {
-			stale.close();
+			impostor.close();
 		}
 
 		const config = await loadConfig(path.join(root, 'config', 'config.json'));

@@ -33,29 +33,6 @@ export function fromBase64(text: string): Uint8Array<ArrayBuffer> {
 	return new Uint8Array(Buffer.from(text, 'base64'));
 }
 
-/**
- * The human half of pairing. Eight characters from an alphabet with no `0/O` or `1/I/L`, printed
- * as two groups so it can be read out loud or typed from a terminal without a second look.
- */
-const CODE_ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
-
-export function randomPairingCode(): string {
-	const bytes = nodeRandomBytes(8);
-	let code = '';
-	for (const byte of bytes) code += CODE_ALPHABET[byte % CODE_ALPHABET.length];
-	return `${code.slice(0, 4)}-${code.slice(4)}`;
-}
-
-/** The same code however the user typed it, so spaces and dashes never matter. */
-export function normalizeCode(code: string): string {
-	return code.replaceAll(/[\s-]/g, '').toUpperCase();
-}
-
-/** Comparing this instead of the code itself keeps the check time-independent of the prefix. */
-export function hashSecret(secret: string): Buffer {
-	return createHash('sha256').update(normalizeCode(secret)).digest();
-}
-
 export function sha256Hex(data: Uint8Array | string): string {
 	return createHash('sha256').update(data).digest('hex');
 }

@@ -11,7 +11,7 @@ import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import path from 'node:path';
 import { homedir } from 'node:os';
-import type { AiProvider } from './protocol.ts';
+import { DEFAULT_RELAY_URL, type AiProvider } from './protocol.ts';
 import { slugify } from './util.ts';
 
 export interface ShareRecord {
@@ -25,6 +25,8 @@ export interface AnkiConfig {
 }
 
 export interface AiConfig {
+	/** The user's toggle. Off means the gateway refuses to send anything. */
+	enabled: boolean;
 	provider: AiProvider;
 	endpoint: string;
 	model: string;
@@ -41,7 +43,8 @@ export interface AuthorizedClient {
 export interface HostConfig {
 	version: 1;
 	hostName: string;
-	port: number;
+	/** Where both ends meet to swap introductions. Any copy of the relay protocol speaks it. */
+	relay: string;
 	folders: Record<string, ShareRecord>;
 	anki: AnkiConfig;
 	ai: AiConfig;
@@ -49,7 +52,6 @@ export interface HostConfig {
 }
 
 export const CONFIG_VERSION = 1;
-export const DEFAULT_PORT = 4287;
 
 export const DEFAULT_ENDPOINTS: Record<AiProvider, string> = {
 	ollama: 'http://127.0.0.1:11434',
@@ -77,10 +79,11 @@ export function defaultConfig(): HostConfig {
 	return {
 		version: CONFIG_VERSION,
 		hostName: hostname(),
-		port: DEFAULT_PORT,
+		relay: DEFAULT_RELAY_URL,
 		folders: {},
 		anki: { enabled: false, port: 8765 },
 		ai: {
+			enabled: false,
 			provider: 'ollama',
 			endpoint: DEFAULT_ENDPOINTS.ollama,
 			model: DEFAULT_MODELS.ollama,
@@ -103,8 +106,8 @@ export function normalizeConfig(raw: unknown): HostConfig {
 	if (!isRecord(raw)) return config;
 
 	if (typeof raw.hostName === 'string' && raw.hostName.trim()) config.hostName = raw.hostName.trim();
-	if (typeof raw.port === 'number' && Number.isInteger(raw.port) && raw.port >= 0 && raw.port <= 65535) {
-		config.port = raw.port;
+	if (typeof raw.relay === 'string' && /^wss?:\/\//.test(raw.relay.trim())) {
+		config.relay = raw.relay.trim();
 	}
 
 	if (isRecord(raw.folders)) {
@@ -125,6 +128,7 @@ export function normalizeConfig(raw: unknown): HostConfig {
 	}
 
 	if (isRecord(raw.ai)) {
+		if (typeof raw.ai.enabled === 'boolean') config.ai.enabled = raw.ai.enabled;
 		if (raw.ai.provider === 'ollama' || raw.ai.provider === 'openai') {
 			config.ai.provider = raw.ai.provider;
 		}
