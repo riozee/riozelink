@@ -5,6 +5,11 @@
  *
  * There is no `relay` command and no server to deploy: signaling is a public PeerServer by
  * default, and `--signal` points both ends at your own when you want one.
+ *
+ * Minting a pairing code is deliberately not a command here. It is runtime state rather than
+ * configuration, and the only things that mint one are the daemon's own panel and its own signal
+ * handlers. A command would need a way to reach a running daemon, and any local socket that handed
+ * out pairing codes would hand them to every other process on the machine as well.
  */
 import { stat } from 'node:fs/promises';
 import path from 'node:path';
@@ -13,6 +18,7 @@ import { Dashboard } from './dashboard.ts';
 import { HOST_VERSION, RiozeLinkHost } from './host.ts';
 import { DEFAULT_SIGNAL_URL } from './protocol.ts';
 import { displayPath, maskKey, truncate } from './util.ts';
+import { displayPhrase } from './words.ts';
 
 interface ParsedArgs {
 	command: string;
@@ -76,14 +82,19 @@ Serve options
   --signal <url>                    the meeting point (default ${DEFAULT_SIGNAL_URL})
   --config-dir <path>               where config.json and identity.json live
   --stun <url>[,<url>]              STUN servers for the WebRTC candidates
-  --quiet                           print the words once, then only log lines
+  --quiet                           print the code once, then only log lines
 
 The daemon never listens on a port. It registers a peer id on a signaling server and waits,
 so a browser anywhere can meet it. That server is a public PeerServer by default; run
 "npx peerjs --port 9000" and pass --signal ws://your-host:9000/peerjs to use your own. No
 TURN server is involved, which is the one limitation worth knowing: on a hostile network the
-peers may not be able to reach each other at all. The pairing phrase on the panel is four
-words; it is replaced every fifteen minutes, or the moment a browser pairs.
+peers may not be able to reach each other at all.
+
+A pairing code is four words and four characters, and it is minted rather than standing. One
+is made at startup and lives for three minutes. Press n on the panel for another, or send
+SIGUSR2 when there is no panel to press. Once a code expires or a browser uses it, the room
+it named comes off the signaling server and the daemon is left registered only under the ids
+it shares with browsers it already knows.
 `);
 }
 
@@ -105,8 +116,24 @@ async function serve(args: ParsedArgs): Promise<void> {
 	});
 	await host.start();
 
+	if (process.platform !== 'win32') {
+		// A daemon under a service manager has no panel and no keyboard, so a signal is the one way
+		// to ask for a fresh code. SIGUSR2 rather than SIGUSR1, which Node keeps for its debugger.
+		process.on('SIGUSR2', () => {
+			host.mintPairingCode();
+			// The panel redraws itself, so only a quiet daemon needs the code written out here. It
+			// lands wherever the log goes, which for a service manager is the only screen there is.
+			if (!quiet) return;
+			const fresh = host.pairingCode();
+			if (fresh) process.stdout.write(`code ${displayPhrase(fresh)}\n`);
+		});
+	}
+
 	if (quiet) {
-		process.stdout.write(`signal ${host.signalUrl()}\nwords ${host.currentPairingPhrase()}\n`);
+		const code = host.pairingCode();
+		const hint = process.platform === 'win32' ? 'restart the daemon' : 'send SIGUSR2';
+		process.stdout.write(`signal ${host.signalUrl()}\n`);
+		process.stdout.write(code ? `code ${displayPhrase(code)}\n` : `code none, ${hint} for one\n`);
 	}
 
 	const dashboard = quiet

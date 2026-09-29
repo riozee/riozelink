@@ -1,7 +1,7 @@
 /**
  * One registration with a signaling server.
  *
- * A link owns one peer id: the daemon keeps one for the pairing phrase and one for every browser it
+ * A link owns one peer id: the daemon keeps one for the pairing code and one for every browser it
  * has paired with. The server (the public PeerServer by default, or your own on a URL you choose)
  * remembers that the id is here and forwards OFFER, ANSWER and CANDIDATE frames addressed to it.
  *

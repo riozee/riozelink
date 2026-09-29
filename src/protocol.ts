@@ -84,8 +84,8 @@ export const WEB_CHUNK = VFS_CHUNK;
  * browser). The host has one too. Hello proves the host, proof and pairing prove the client.
  * Everything is WebCrypto on both sides, so the signature formats match exactly.
  *
- * Pairing also has to prove that the person typing knows the four words. That proof is an HMAC,
- * not a signature: the phrase is stretched with PBKDF2 first (see {@link derivePairingKey}), and
+ * Pairing also has to prove that the person typing knows the code. That proof is an HMAC,
+ * not a signature: the code is stretched with PBKDF2 first (see {@link derivePairingKey}), and
  * the code the host generated is never sent back over the wire in any form.
  * ---------------------------------------------------------------------------------------------- */
 
@@ -124,9 +124,9 @@ export interface AuthProvePayload {
 	signature: string;
 }
 
-/** A first-time client pairs with the phrase the host prints. */
+/** A first-time client pairs with the code the host prints. */
 export interface AuthPairPayload {
-	/** Base64 HMAC of the host nonce, keyed by the phrase. See {@link pairProof}. */
+	/** Base64 HMAC of the host nonce, keyed by the code. See {@link pairProof}. */
 	proof: string;
 	/** ECDSA signature over the host nonce, so the key being stored is the key being used. */
 	signature: string;
@@ -652,13 +652,13 @@ export function signalSocketUrl(base: string, id: string, token: string): string
 /* ------------------------------------------------------------------------------------------------
  * Words, rooms and the pairing proof
  *
- * One phrase does three jobs: a person reads it off the host's terminal, it names the room on the
+ * One code does three jobs: a person reads it off the host's terminal, it names the room on the
  * relay, and it is the secret that proves the person was at that terminal. It is never sent
- * anywhere. Both sides hash it into a room name and stretch it into an HMAC key, so the relay
- * only ever sees the hash and the host only ever sees the proof.
+ * anywhere. Both sides stretch it twice, once into the room name and once into an HMAC key, so the
+ * relay only ever sees a derived value and the host only ever sees the proof.
  * ---------------------------------------------------------------------------------------------- */
 
-/** PBKDF2 rounds. Slow enough to make a phrase list painful to walk, fast enough to feel instant. */
+/** PBKDF2 rounds. Slow enough to make a code list painful to walk, fast enough to feel instant. */
 export const PAIR_KDF_ITERATIONS = 100_000;
 
 /** Keeps the key bound to this protocol version and this job. */
@@ -701,13 +701,50 @@ export async function sha256Hex(text: string): Promise<string> {
 	return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
+/** The salt the room name is stretched with. Distinct from the proof's, so the two never mix. */
+export const ROOM_KDF_SALT = 'riozelink:room:v1';
+
 /**
- * The pairing id: a hash of the phrase, so the signaling server never learns the words. Two ends can
- * only meet here if they were told the same phrase, and the phrase dies with the pairing window.
+ * The code, stretched to 256 bits.
+ *
+ * The room name is the one low-entropy secret this protocol publishes: the daemon registers it as a
+ * peer id, which puts it in the connection string the signaling server reads. Deriving it with a
+ * plain hash would let whoever reads that name test the whole code space offline at hash speed,
+ * which is the difference between an afternoon and an afternoon that never ends. Stretching costs
+ * the same 100,000 rounds the proof costs, once per connection, and that is affordable.
+ */
+async function deriveRoomKey(phrase: string): Promise<ArrayBuffer> {
+	const material = await crypto.subtle.importKey(
+		'raw',
+		new TextEncoder().encode(normalizePhrase(phrase)),
+		'PBKDF2',
+		false,
+		['deriveBits']
+	);
+	return crypto.subtle.deriveBits(
+		{
+			name: 'PBKDF2',
+			salt: new TextEncoder().encode(ROOM_KDF_SALT),
+			iterations: PAIR_KDF_ITERATIONS,
+			hash: 'SHA-256'
+		},
+		material,
+		256
+	);
+}
+
+/**
+ * The pairing id: a stretched form of the code, so the signaling server never learns the code and
+ * could not walk the space if it kept a copy of this id either. Two ends can only meet here if they
+ * were told the same code, and the code dies with the pairing window.
  */
 export function pairId(phrase: string): Promise<string> {
-	return sha256Hex(`riozelink:pair:v1:${normalizePhrase(phrase)}`).then(
-		(hex) => `rz-pair-${hex.slice(0, 24)}`
+	return deriveRoomKey(phrase).then(
+		(bits) =>
+			`rz-pair-${[...new Uint8Array(bits)]
+				.map((byte) => byte.toString(16).padStart(2, '0'))
+				.join('')
+				.slice(0, 24)}`
 	);
 }
 

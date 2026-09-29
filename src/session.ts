@@ -8,8 +8,8 @@
  *
  * The order is fixed. `auth:hello` proves the host to the client by signing the client's nonce.
  * Then either `auth:prove` (a returning client signs the host's nonce) or `auth:pair` (the same,
- * plus an HMAC over the nonce made with the four words the host printed). Only after that does any
- * other subsystem answer.
+ * plus an HMAC over the nonce made with the code the host printed). Only after that does any other
+ * subsystem answer.
  */
 import type { RTCDataChannel } from 'werift';
 import type { AnkiService } from './anki.ts';
@@ -52,7 +52,7 @@ export interface SessionHost {
 	broadcastEvent(subsystem: RpcSubsystem, action: string, payload: unknown): void;
 	clientsChanged(): void;
 	verifyPairingProof(proof: string, hostNonce: string): Promise<boolean>;
-	consumePairingPhrase(): void;
+	retireUsedPairingCode(): void;
 	pairingFailed(): void;
 	createShare(absPath: string, label: string): Promise<{ id: string; share: ShareRecord }>;
 	removeShare(id: string): Promise<void>;
@@ -83,7 +83,7 @@ export class ClientSession {
 	clientName = 'Browser';
 	clientLabel = '';
 	fingerprint = '';
-	/** How this client arrived: through the pairing phrase, or straight into its own link room. */
+	/** How this client arrived: through the pairing code, or straight into its own link room. */
 	readonly origin: 'pair' | 'link';
 
 	private clientPublicKey = '';
@@ -293,14 +293,14 @@ export class ClientSession {
 		const proof = requireString(payload.proof, 'proof');
 		const name = cleanName(payload.clientName ?? this.clientName);
 
-		// Both checks always run, so a wrong phrase and a wrong key take the same time and answer
+		// Both checks always run, so a wrong code and a wrong key take the same time and answer
 		// with the same words.
 		const signatureOk = await this.verifyClientProof(signature);
 		const phraseOk = await this.host.verifyPairingProof(proof, this.hostNonce);
 		if (!signatureOk || !phraseOk) {
 			this.host.pairingFailed();
 			throw new HostError(
-				'pairing failed. Check the four words on the host and try again.',
+				'pairing failed. Check the code on the host and try again.',
 				'auth'
 			);
 		}
@@ -311,7 +311,7 @@ export class ClientSession {
 			pairedAt: Date.now()
 		};
 		await this.host.save();
-		this.host.consumePairingPhrase();
+		this.host.retireUsedPairingCode();
 		this.host.log('info', `paired with ${name} (${this.fingerprint})`);
 		return this.becomeReady(name);
 	}

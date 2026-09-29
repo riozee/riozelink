@@ -1,18 +1,33 @@
 /**
- * The four words.
+ * The pairing code: four words, then four Crockford characters.
  *
- * A pairing phrase is the only thing a user ever types, and it carries the whole introduction: the
- * words name the room on the relay and they are the secret the proof is derived from. There is no
- * address, no port, and nothing to copy out of a config file.
+ * A code is the only thing a user ever types, and it carries the whole introduction. It names the
+ * room on the relay and it is the secret the proof is derived from. There is no address, no port,
+ * and nothing to copy out of a config file.
  *
- * The list is short on purpose. Five hundred plain English words are enough for four words of
- * phrase (about 36 bits), which no stranger could ever walk through before the phrase expires and
- * the attempts run out. Every word is lowercase, three to eight letters, spelled the way it
- * sounds, and free of lookalike characters, because a person may have to read these aloud off a
- * terminal.
+ * Four words out of this list are about 36 bits, and the tail adds 20 more, so a code is about 56
+ * bits. That is what makes the room name safe to publish. The room is stretched out of the code
+ * with PBKDF2 rather than hashed from it, so a signaling server that reads the room name still
+ * cannot walk the code space at hash speed.
+ *
+ * The list is short on purpose. Every word is lowercase, spelled the way it sounds, and free of
+ * lookalike characters, because a person may have to read these off a terminal.
  */
 
+/** How many words a generated code starts with. The tail is not counted here. */
 export const PHRASES_ARE_WORDS = 4;
+
+/**
+ * The characters that ride after the words.
+ *
+ * Crockford's Base32 alphabet: the digits and the uppercase letters with `I`, `L`, `O` and `U`
+ * taken out. The omissions are the point. `O` beside `0` and `I` beside `1` are the mistakes a
+ * person actually makes reading a code off a screen, and neither can be produced here.
+ */
+export const PHRASE_CODE_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+
+/** How many of them a code carries. Four characters is 20 bits for four keystrokes. */
+export const PHRASE_CODE_LENGTH = 4;
 
 const WORDS: readonly string[] = [
 	// nature
@@ -558,7 +573,7 @@ const WORDS: readonly string[] = [
 	'write'
 ];
 
-/** Every word a phrase may be built from. Read-only, and duplicated nowhere. */
+/** Every word a code may be built from. Read-only, and duplicated nowhere. */
 export const PHRASE_WORDS: readonly string[] = WORDS;
 
 export function isPhraseWord(word: string): boolean {
@@ -566,7 +581,7 @@ export function isPhraseWord(word: string): boolean {
 }
 
 function pickWord(): string {
-	// Rejection sampling keeps every word equally likely; a modulo bias would shrink the phrase
+	// Rejection sampling keeps every word equally likely; a modulo bias would shrink the code
 	// space by a hair, which is a silly thing to leave in security math.
 	const limit = Math.floor(0x100000000 / WORDS.length) * WORDS.length;
 	const buffer = new Uint32Array(1);
@@ -576,26 +591,46 @@ function pickWord(): string {
 	}
 }
 
-/** `amber-cobalt-summit-drift` — four words, one dash between each, nothing else. */
+/** The same rejection sampling, over the 32 symbol tail alphabet. */
+function pickCode(): string {
+	const size = PHRASE_CODE_ALPHABET.length;
+	const limit = Math.floor(0x100000000 / size) * size;
+	const buffer = new Uint32Array(1);
+	let code = '';
+	while (code.length < PHRASE_CODE_LENGTH) {
+		crypto.getRandomValues(buffer);
+		if (buffer[0] >= limit) continue;
+		code += PHRASE_CODE_ALPHABET[buffer[0] % size];
+	}
+	return code;
+}
+
+/**
+ * `amber-cobalt-summit-drift-4G2X` — four words, then four characters, one dash between each.
+ *
+ * The dashes are a canonical spelling rather than part of the secret: {@link normalizePhrase}
+ * accepts spaces, capitals and any other punctuation and folds them all onto this shape.
+ */
 export function generatePhrase(wordCount = PHRASES_ARE_WORDS): string {
 	const words: string[] = [];
 	while (words.length < wordCount) {
 		const word = pickWord();
 		if (!words.includes(word)) words.push(word);
 	}
-	return words.join('-');
+	return [...words, pickCode()].join('-');
 }
 
 /**
  * Whatever the user typed, in the one spelling the rooms are derived from.
  *
- * People paste with spaces, type with capitals, and occasionally leave a trailing dash. All of
- * that is the same phrase, and it has to hash to the same room on both ends.
+ * People paste with spaces, type with capitals, and occasionally leave a trailing dash. Digits are
+ * kept, because the tail needs them. All of that lands on the same phrase, and it has to derive the
+ * same room and the same proof on both ends.
  */
 export function normalizePhrase(input: string): string {
 	return input
 		.toLowerCase()
-		.replaceAll(/[^a-z]+/g, '-')
+		.replaceAll(/[^a-z0-9]+/g, '-')
 		.replaceAll(/^-+|-+$/g, '');
 }
 
@@ -604,11 +639,31 @@ export function splitPhrase(phrase: string): string[] {
 	return normalized ? normalized.split('-') : [];
 }
 
+/** True when `tail` is exactly one code's worth of the tail alphabet. */
+function isCodeShaped(tail: string): boolean {
+	if (tail.length !== PHRASE_CODE_LENGTH) return false;
+	return [...tail].every((character) => PHRASE_CODE_ALPHABET.includes(character.toUpperCase()));
+}
+
 /**
- * Three to six words is a phrase a person meant to type. Fewer is a typo, more is a paste
- * accident, and both are worth saying out loud before a WebRTC handshake is attempted.
+ * Three to six words with a code tail is what a person meant to type. Fewer words is a typo, more is
+ * a paste accident, and a missing tail is the part people drop, so all three are worth saying out
+ * loud before a WebRTC handshake is attempted.
  */
 export function isPhraseShaped(phrase: string): boolean {
-	const words = splitPhrase(phrase);
-	return words.length >= 3 && words.length <= 6;
+	const parts = splitPhrase(phrase);
+	if (parts.length < 2) return false;
+	const words = parts.slice(0, -1);
+	return words.length >= 3 && words.length <= 6 && isCodeShaped(parts[parts.length - 1]);
+}
+
+/**
+ * The code the way a terminal shows it: uppercase, spaces instead of dashes.
+ *
+ * Spaces are safe here because {@link normalizePhrase} turns any run of punctuation back into a
+ * single dash, so what a person reads off the screen and types derives exactly the same room and
+ * the same proof as the phrase the daemon generated.
+ */
+export function displayPhrase(phrase: string): string {
+	return splitPhrase(phrase).join(' ').toUpperCase();
 }

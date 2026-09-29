@@ -21,7 +21,7 @@ walk in.
 └──────────────────────┘      │       └──────────────────────┘
                               │                    riozeOS app
                  a signaling server introduces the two once
-                 (four words, then never again)
+                 (a pairing code, then never again)
 ```
 
 ## Why people run it
@@ -92,13 +92,17 @@ config   ~/.config/riozelink/config.json
 riozelink folders add ~/Notes --label Notes
 ```
 
-**3. Connect riozeOS.** Open riozeOS and start the **RiozeLink** app. Type the four words and
-press Connect. That is the entire setup. No address, no port, no code to copy carefully.
+**3. Connect riozeOS.** The panel already has a code on it, because one is minted for you at
+startup. Open riozeOS, start the **RiozeLink** app, type that code in, and press Connect. That is
+the entire setup. No address to copy, no port to open, and nothing that has to be read twice to be
+sure of it. If the code has lapsed, press `n` on the panel for a fresh one.
 
 What happens under the hood, in order:
 
-1. The words name a meeting point. Both the daemon and the browser hash them into the same peer id
-   and register with the signaling server under it. The server never learns the words themselves.
+1. The code names a meeting point. Both the daemon and the browser stretch it with PBKDF2 into the
+   same peer id and register with the signaling server under it. The server sees that id and never
+   the code, and working back from the id to the code costs a hundred thousand rounds per guess
+   rather than one hash.
 2. The browser generates an ECDSA P-256 key pair and keeps the private half non-extractable in
    IndexedDB. It never leaves the browser.
 3. The two sides swap a WebRTC offer and answer through the server. This is only an introduction.
@@ -107,12 +111,13 @@ What happens under the hood, in order:
 4. Over that channel the browser sends `auth:hello`. The daemon answers with its own public key, a
    nonce, and a signature over the browser's nonce. The client verifies it, so it knows it found
    your daemon and not something else that answered on the way.
-5. For the first pairing the browser must also prove it knows the words: it stretches them with
-   PBKDF2 into a key and sends an HMAC of the daemon's nonce. The phrase itself never crosses the
+5. For the first pairing the browser must also prove it knows the code: it stretches it with
+   PBKDF2 into a key and sends an HMAC of the daemon's nonce. The code itself never crosses the
    wire. The same message carries a signature from the browser's key, so the key being stored is
    the key being used.
 6. The daemon checks both, writes the browser's fingerprint into `authorizedClients`, and retires
-   the words on the spot. A fresh phrase appears for the next device.
+   the code on the spot. The room it named comes down with it, and nothing takes its place until
+   somebody asks for another one.
 
 **4. Use it.** The shared folder appears in the riozeOS File Explorer under `/riozeos/drives/remote-notes`.
 Every read and write you make there lands on the folder you picked.
@@ -237,8 +242,8 @@ their hands off a real home directory.
 | `riozelink clients revoke <name>`               | Forgets one, name and all.                                 |
 | `riozelink status`                              | A summary of the config file, clients included.            |
 
-On the panel, `n` rolls a fresh phrase, `h` shows the first-connection notes, and `q` stops
-the daemon.
+On the panel, `n` mints a pairing code, `h` shows the first-connection notes, and `q` stops
+the daemon. A daemon running with no panel does the same job on `SIGUSR2`.
 
 ## The meeting point
 
@@ -271,7 +276,7 @@ this design that costs money to run.
 
 | Piece         | Where it lives                 | What it does                                                                                                                 |
 | ------------- | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
-| The words     | `src/words.ts`                 | 534 plain words, four per phrase, no lookalike characters. About 36 bits each.                                               |
+| The code      | `src/words.ts`                 | 534 plain words and Crockford's 32 characters. Four of each, about 56 bits, no confusable pairs.                             |
 | Signaling     | `src/signal.ts`                | One registration per peer id, heartbeats, reconnects with backoff.                                                           |
 | WebRTC link   | `src/peer.ts`                  | Answers the browser's offer, trickles candidates, hands over the DataChannel.                                                |
 | Auth          | `src/session.ts`               | Hello, proof, pairing. Every other message waits behind it.                                                                  |
@@ -317,21 +322,38 @@ The daemon generates its own ECDSA P-256 key pair on first start, in `identity.j
 pins the fingerprint it sees during the first pairing and re-checks it on every connection, which is
 why a different machine cannot quietly take over.
 
-Returning needs no words because the name both ends register under is proof enough of who belongs
+Returning needs no code because the name both ends register under is proof enough of who belongs
 there. They hash their two public fingerprints together, and only those two can arrive at that
 name. The daemon holds one such registration per paired browser and nothing else, so a client it has
 never met has nowhere to knock.
 
-### The four words
+### The pairing code
 
-A phrase is four words from a list of 534, about 36 bits. That is far too much for a stranger to
-walk through. Ten wrong attempts invite a fresh phrase, the phrase itself dies after fifteen
-minutes, and it retires the moment it is used. It is also short enough to read off a terminal and
-type on a phone.
+A code is four words from a list of 534 words, then four characters from Crockford's Base32 alphabet.
+The words are about 36 bits and the tail adds 20 more, and the alphabet leaves out `I`, `L`, `O` and
+`U`, so the two characters a person actually confuses, `O` with `0` and `I` with `1`, can never both
+appear. It is short enough to read off a terminal and type on a phone without going back to check.
 
-The phrase does three jobs at once. It is what a person reads, it names the meeting point once it
-is hashed, and it is the secret that proves the person was at that terminal. The proof is an HMAC
-through a PBKDF2-stretched key, so the phrase itself never crosses the wire in either direction.
+The code does three jobs at once. It is what a person reads, it names the meeting point, and it is
+the secret that proves the person was at that terminal.
+
+The proof is an HMAC through a PBKDF2-stretched key, so the code itself never crosses the wire in
+either direction. The room name gets the same treatment, and that one matters more than it looks.
+The room name is the single thing here that gets published, because the daemon registers it as a
+peer id and that puts it in the connection string the signaling server reads. A plain hash at that
+spot would let whoever read the id test the whole code space offline at hash speed. Stretching it
+costs the same hundred thousand rounds, once per connection, which is affordable.
+
+A code is minted, never standing. One is made at startup and one whenever you ask for another, it
+lives for three minutes, and nothing renews it. Ten wrong tries spend it early, and it retires the
+moment a browser pairs with it. Between those moments the daemon is registered only under the ids it
+shares with browsers it already knows, so there is no room for a stranger to find and nothing worth
+guessing at while nobody is being let in.
+
+Asking for another one means pressing `n` on the panel, or sending `SIGUSR2` to the daemon when
+there is no panel to press. Minting is deliberately not a subcommand. The only way a command could
+reach a running daemon is a local socket, and a socket that hands out pairing codes would hand them
+to every other process on the machine, which is the one guarantee this design is built on.
 
 ### Several browsers at once
 
@@ -352,7 +374,7 @@ rename shows up as a removal and a creation, which is true from where the client
 The link is private by construction. The DataChannel is encrypted with DTLS between the two peers,
 so the signaling server only ever carries introductions. Every session has to pass the auth exchange
 before any other message is answered, and both sides sign a nonce the other side chose, so a replay
-or a machine-in-the-middle does not get in. A pairing also has to prove the four words, which is what
+or a machine-in-the-middle does not get in. A pairing also has to prove the code, which is what
 stops someone who wandered into the right meeting point.
 
 What the daemon will never do, no matter who asks:
@@ -366,20 +388,21 @@ What is worth knowing:
 
 - An authorized client can add new folders to share and turn Anki on. That is the feature, but it
   is also reach. Revoke a client with `riozelink clients revoke <name>` and restart the daemon.
-- The four words are a secret while they last. Pair from a terminal you are looking at, and do not
-  read them out to anyone you would not hand a key to.
-- The signaling server sees that two connections met under some name. It does not see the words,
-  the files, the chats, or the keys. It is somebody else's machine by default, so treat it as one
-  more party that can watch introductions and run your own when you would rather it did not.
+- The pairing code is a secret while it lasts, and it does not last long. Pair from a terminal you
+  are looking at, and do not read the code out to anyone you would not hand a key to.
+- The signaling server sees that two connections met under some name. It does not see the code, the
+  files, the chats, or the keys. It is somebody else's machine by default, so treat it as one more
+  party that can watch introductions and run your own when you would rather it did not.
 - The config file holds your API key in plain text. It is written with permissions for your user
   only, which protects it from other accounts, not from you.
 
 ## Troubleshooting
 
-**"Pairing failed. Check the four words on the host and try again."** A phrase expires after fifteen
-minutes and retires the moment another device uses it. Look at the panel for the current one.
+**"Pairing failed. Check the code on the host and try again."** A code expires after three minutes and
+retires the moment another device uses it. Look at the panel. If that line says none, press `n` for
+a fresh one, then try the code it shows.
 
-**Nothing happens when the words are typed.** The two ends meet on a signaling server. If the daemon
+**Nothing happens when the code is typed.** The two ends meet on a signaling server. If the daemon
 cannot reach `wss://0.peerjs.com/peerjs`, check its log for a retry line. If you run your own, make
 sure both ends were told the same address. The panel and the app's Overview tab both say which
 server is in use.

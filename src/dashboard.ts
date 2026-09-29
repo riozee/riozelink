@@ -1,15 +1,19 @@
 /**
  * The terminal face of the daemon.
  *
- * On a TTY it paints a small live panel: the four words RiozeOS will ask for, the signaling server both ends
- * meet on, who is connected, which folders are shared, and the last few things that happened.
- * `n` rolls a new phrase, `h` explains the first connection, `q` stops the daemon.
+ * On a TTY it paints a small live panel: the pairing code RiozeOS will ask for, the signaling
+ * server both ends meet on, who is connected, which folders are shared, and the last few things
+ * that happened. `n` mints a code, `h` explains the first connection, `q` stops the daemon.
+ *
+ * A code is not always there to show. It appears when it is minted and disappears when it expires
+ * or is used, so the panel has two shapes for that one line.
  *
  * Without a TTY (a service manager, a pipe, CI) it prints the panel once and then one line per
  * event, which is what a log file wants.
  */
 import type { LogEntry, RiozeLinkHost } from './host.ts';
 import { truncate } from './util.ts';
+import { displayPhrase } from './words.ts';
 
 const ESC = '\x1b[';
 const color = {
@@ -88,7 +92,7 @@ export class Dashboard {
 			return;
 		}
 		if (key === 'n') {
-			this.host.rotatePairing();
+			this.host.mintPairingCode();
 			return;
 		}
 		if (key === 'h') {
@@ -128,20 +132,30 @@ export class Dashboard {
 		return `${this.paint(time, 'dim')}  ${this.paint(entry.message, tone)}`;
 	}
 
+	/** What to say when no code is live. How to ask for one differs by how this daemon is being run. */
+	private idleHint(): string {
+		if (this.tty) return 'none, press n to make one';
+		if (process.platform === 'win32') return 'none, restart the daemon to make one';
+		return 'none, send SIGUSR2 for one';
+	}
+
 	private buildLines(): string[] {
 		const host = this.host;
 		const clientCount = host.readyClients();
 		const state = clientCount > 0 ? `${clientCount} connected` : 'no clients yet';
+		// Uppercase, spaces instead of dashes: the shape a person reads off the screen and types.
+		const code = host.pairingCode();
+		const codeLine = code
+			? `${this.paint(displayPhrase(code), 'bold')} ` +
+				this.paint(`(${host.pairingRemainingLabel()} left)`, 'dim')
+			: this.paint(this.idleHint(), 'dim');
 		const lines: string[] = [];
 
 		lines.push(
 			`${this.paint(`RIozeLink ${host.hostVersion}`, 'bold')} ${this.paint('· listening', 'green')}`
 		);
 		lines.push(`${this.paint('signal   ', 'dim')} ${this.paint(host.signalUrl(), 'dim')}`);
-		lines.push(
-			`${this.paint('words    ', 'dim')} ${this.paint(host.currentPairingPhrase(), 'bold')} ` +
-				this.paint(`(${host.pairingRemainingLabel()} left)`, 'dim')
-		);
+		lines.push(`${this.paint('code     ', 'dim')} ${codeLine}`);
 		lines.push(`${this.paint('clients  ', 'dim')} ${state}`);
 		const shares = Object.entries(host.shares());
 		if (shares.length === 0) {
@@ -155,10 +169,10 @@ export class Dashboard {
 
 		if (this.help) {
 			lines.push(this.paint('how to connect', 'bold'));
-			lines.push(`  1. open riozeOS, start the RiozeLink app, and type the four words above`);
-			lines.push(`     nobody who cannot read this terminal can pair, and the words retire`);
-			lines.push(`     the moment a browser uses them`);
-			lines.push(`  2. the browser remembers this computer, so the next visit needs no words`);
+			lines.push(`  1. press n for a code, then open riozeOS, start the RiozeLink app, and type it in`);
+			lines.push(`     nobody who cannot read this terminal can pair, and a code is spent the`);
+			lines.push(`     moment a browser uses it`);
+			lines.push(`  2. the browser remembers this computer, so the next visit needs no code`);
 			lines.push('');
 		}
 
@@ -169,7 +183,7 @@ export class Dashboard {
 
 		if (this.tty) {
 			lines.push('');
-			lines.push(this.paint('[n] new words   [h] help   [q] quit', 'dim'));
+			lines.push(this.paint('[n] mint a code   [h] help   [q] quit', 'dim'));
 		}
 		return lines;
 	}

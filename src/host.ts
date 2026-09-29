@@ -2,14 +2,18 @@
  * The daemon itself.
  *
  * One identity, one config file, one signaling server, one set of shared folders. The host dials
- * *out*: it registers one peer id for the pairing phrase and one for every browser it has paired
+ * *out*: it registers one peer id for the pairing code and one for every browser it has paired
  * with, so nothing here ever asks the user for an address, a port, or a network that happens to be
  * local.
  *
- * The pairing phrase is the only secret that ever appears in a terminal. It lives for fifteen
- * minutes or until a client successfully pairs, whichever comes first, and ten failed attempts
- * replace it early. After that the phrase is dead weight: returning clients meet the host under an
- * id named after both their fingerprints and authenticate with their own key.
+ * A pairing code is minted, never standing. One is made at startup and one whenever the user asks
+ * for another, it lives for three minutes, and nothing renews it. When it expires or a browser uses
+ * it, the room it named comes down and the daemon is left registered only under the ids it shares
+ * with browsers it already knows. That quiet default is the point: the one id in this design whose
+ * secret is small enough to attack is the one that exists only while somebody is being let in.
+ *
+ * The code is the only secret that ever appears in a terminal. Returning clients meet the host
+ * under an id named after both their fingerprints, and authenticate with their own key.
  */
 import { stat } from 'node:fs/promises';
 import { timingSafeEqual } from 'node:crypto';
@@ -47,7 +51,7 @@ import { generatePhrase } from './words.ts';
 
 export const HOST_VERSION = '0.3.0';
 
-const PAIRING_TTL_MS = 15 * 60_000;
+const PAIRING_TTL_MS = 3 * 60_000;
 const MAX_PAIRING_FAILURES = 10;
 const MAX_LOG_LINES = 200;
 const ANKI_PROBE_MS = 5_000;
@@ -66,6 +70,8 @@ export interface RiozeLinkHostOptions {
 	configDir?: string;
 	/** Overrides the signaling server URL in the config file. */
 	signal?: string;
+	/** Overrides how long a minted code is good for. The tests use it. */
+	pairingTtlMs?: number;
 	hostName?: string;
 	iceServers?: string[];
 	onLog?(entry: LogEntry): void;
@@ -77,7 +83,7 @@ interface HostLink {
 	/** The peer id this link holds. */
 	id: string;
 	kind: 'pair' | 'link';
-	/** The client label for a client link, `pairing` for the phrase one. */
+	/** The client label for a client link, `pairing` for the code one. */
 	label: string;
 	link: SignalLink;
 	peer: PeerLink | null;
@@ -95,15 +101,19 @@ export class RiozeLinkHost implements SessionHost {
 	readonly ai: AiService;
 
 	private readonly options: RiozeLinkHostOptions;
+	/** How long a minted code is good for. Three minutes unless a test says otherwise. */
+	private readonly pairingTtlMs: number;
 	private readonly sessions = new Map<string, ClientSession>();
 	private readonly links = new Map<string, HostLink>();
 	private readonly watcher: ShareWatcher;
 	private readonly logs: LogEntry[] = [];
 	private readonly listeners = new Set<() => void>();
 	private signalBase: string;
-	private pairingPhrase = generatePhrase();
+	/** The live code, or null when nothing is listening for one. */
+	private pairingPhrase: string | null = generatePhrase();
 	private pairingCreatedAt = Date.now();
 	private pairingFailures = 0;
+	private pairingTimer: NodeJS.Timeout | null = null;
 	private ankiTimer: NodeJS.Timeout | null = null;
 	private lastAnkiStatus: AnkiStatusReply | null = null;
 	private logSeq = 0;
@@ -116,6 +126,7 @@ export class RiozeLinkHost implements SessionHost {
 		identity: HostIdentity
 	) {
 		this.options = options;
+		this.pairingTtlMs = options.pairingTtlMs ?? PAIRING_TTL_MS;
 		this.configDir = configDir;
 		this.configPath = path.join(configDir, 'config.json');
 		this.config = config;
@@ -153,6 +164,7 @@ export class RiozeLinkHost implements SessionHost {
 	async start(): Promise<void> {
 		this.watcher.update(this.config.folders);
 		await this.syncLinks();
+		this.armPairingExpiry();
 		this.startAnkiWatch();
 		void sweepPartials(this.config.folders).then((removed) => {
 			if (removed > 0) {
@@ -167,6 +179,7 @@ export class RiozeLinkHost implements SessionHost {
 	async stop(reason = 'shutting down'): Promise<void> {
 		this.watcher.stop();
 		this.ai.cancelAll();
+		this.clearPairingTimer();
 		if (this.ankiTimer) clearInterval(this.ankiTimer);
 		this.ankiTimer = null;
 		for (const session of [...this.sessions.values()]) session.dispose(reason);
@@ -179,13 +192,17 @@ export class RiozeLinkHost implements SessionHost {
 	/* -------------------------------------------------------------------- links ------- */
 
 	/**
-	 * Makes the registrations on the signaling server match the ones this host should be holding:
-	 * the live pairing phrase, plus one quiet id per paired client. Called at boot, after a phrase
-	 * rotates, and whenever the client list changes.
+	 * Makes the registrations on the signaling server match the ones this host should be holding: a
+	 * pairing room while a code is live, plus one quiet id per paired client. Called at boot,
+	 * whenever a code is minted or retired, and whenever the client list changes.
+	 *
+	 * The pairing room being absent from `desired` is what takes it off the server. Nothing else has
+	 * to remember to close it.
 	 */
 	async syncLinks(): Promise<void> {
 		const desired = new Map<string, { kind: 'pair' | 'link'; label: string }>();
-		desired.set(await pairId(this.pairingPhrase), { kind: 'pair', label: 'pairing' });
+		const code = this.pairingCode();
+		if (code) desired.set(await pairId(code), { kind: 'pair', label: 'pairing' });
 		for (const [fingerprint, client] of Object.entries(this.config.authorizedClients)) {
 			desired.set(await linkId(this.identity.fingerprintHex, fingerprint), {
 				kind: 'link',
@@ -198,7 +215,7 @@ export class RiozeLinkHost implements SessionHost {
 			if (wanted?.kind === entry.kind) continue;
 			this.links.delete(id);
 			// A client link only closes when the browser behind it was revoked, so its session goes
-			// with it. The pairing link is different: retiring the phrase must never hang up on the
+			// with it. The pairing link is different: retiring the code must never hang up on the
 			// browser that just paired through it, and the DataChannel does not need the signaling
 			// server anymore anyway.
 			if (entry.kind === 'link') {
@@ -406,59 +423,88 @@ export class RiozeLinkHost implements SessionHost {
 
 	/* ------------------------------------------------------------------- pairing ------- */
 
-	private refreshPairingPhrase(): void {
-		if (Date.now() - this.pairingCreatedAt > PAIRING_TTL_MS) {
-			this.pairingPhrase = generatePhrase();
-			this.pairingCreatedAt = Date.now();
-			this.pairingFailures = 0;
-			this.log('info', 'the pairing phrase expired and was replaced');
-			void this.syncLinks();
-			this.notify();
-		}
-	}
-
-	currentPairingPhrase(): string {
-		this.refreshPairingPhrase();
+	/**
+	 * The live code, or null when nothing is listening.
+	 *
+	 * Expiry is read here as well as on the timer, so a code can never reach a proof or a screen
+	 * after its three minutes are up, however late the timer happens to run.
+	 */
+	pairingCode(): string | null {
+		if (!this.pairingPhrase) return null;
+		if (Date.now() - this.pairingCreatedAt > this.pairingTtlMs) return null;
 		return this.pairingPhrase;
 	}
 
 	pairingRemainingMs(): number {
-		this.refreshPairingPhrase();
-		return Math.max(0, this.pairingCreatedAt + PAIRING_TTL_MS - Date.now());
+		if (!this.pairingPhrase) return 0;
+		return Math.max(0, this.pairingCreatedAt + this.pairingTtlMs - Date.now());
 	}
 
-	rotatePairing(): void {
+	/**
+	 * Makes a fresh code and opens the room it names. The only way a code ever appears, and the only
+	 * thing that ever opens a pairing room.
+	 */
+	mintPairingCode(): void {
 		this.pairingPhrase = generatePhrase();
 		this.pairingCreatedAt = Date.now();
 		this.pairingFailures = 0;
-		this.log('info', 'a new pairing phrase is up');
+		this.armPairingExpiry();
+		this.log('info', 'a pairing code is up');
 		void this.syncLinks();
 		this.notify();
 	}
 
 	/**
-	 * The client proves it knows the words by HMAC-ing the host nonce with a key stretched from
-	 * the phrase. The phrase itself never crosses the wire, and the comparison still takes the
-	 * same time whether the first or last character was wrong.
+	 * Retires the code and takes the room down. Nothing makes another one.
+	 *
+	 * Kept public on purpose: `consumePairingPhrase` used to roll a replacement here, which is
+	 * exactly the always-on behaviour this is meant to end.
+	 */
+	retirePairingCode(reason: string): void {
+		this.clearPairingTimer();
+		if (!this.pairingPhrase) return;
+		this.pairingPhrase = null;
+		this.pairingFailures = 0;
+		this.log('info', `${reason}. No pairing room is open now`);
+		void this.syncLinks();
+		this.notify();
+	}
+
+	private armPairingExpiry(): void {
+		this.clearPairingTimer();
+		this.pairingTimer = setTimeout(() => {
+			this.pairingTimer = null;
+			this.retirePairingCode('the pairing code expired');
+		}, this.pairingRemainingMs());
+		this.pairingTimer.unref?.();
+	}
+
+	private clearPairingTimer(): void {
+		if (this.pairingTimer) clearTimeout(this.pairingTimer);
+		this.pairingTimer = null;
+	}
+
+	/**
+	 * The client proves it knows the code by HMAC-ing the host nonce with a key stretched from it.
+	 * The code itself never crosses the wire, the comparison takes the same time whether the first or
+	 * the last character was wrong, and a code that has already lapsed answers with a plain no.
 	 */
 	async verifyPairingProof(proof: string, hostNonce: string): Promise<boolean> {
-		this.refreshPairingPhrase();
-		if (!proof || !hostNonce) return false;
-		const expected = await pairProof(this.pairingPhrase, hostNonce);
+		const code = this.pairingCode();
+		if (!code || !proof || !hostNonce) return false;
+		const expected = await pairProof(code, hostNonce);
 		if (expected.length !== proof.length) return false;
 		return timingSafeEqual(Buffer.from(expected, 'utf8'), Buffer.from(proof, 'utf8'));
 	}
 
-	consumePairingPhrase(): void {
-		// One successful pairing retires the phrase; the next client needs a fresh one.
-		this.rotatePairing();
+	retireUsedPairingCode(): void {
+		this.retirePairingCode('a browser paired');
 	}
 
 	pairingFailed(): void {
 		this.pairingFailures += 1;
 		if (this.pairingFailures >= MAX_PAIRING_FAILURES) {
-			this.log('warn', 'too many wrong pairings; a new phrase is up');
-			this.rotatePairing();
+			this.retirePairingCode('too many wrong codes');
 		}
 	}
 
