@@ -13,6 +13,7 @@
  * build their client and their dispatcher out of it, so a typo is a compile error rather than a
  * message that silently goes nowhere.
  */
+import { isPhraseShaped, normalizePhrase } from './words.ts';
 
 export const PROTOCOL_VERSION = 1;
 
@@ -640,21 +641,16 @@ function base64ToBytes(text: string): Uint8Array<ArrayBuffer> {
 	return bytes;
 }
 
-/** The one spelling of a phrase both ends agree on: lowercase words, single dashes. */
-export function normalizePhrase(input: string): string {
-	return input
-		.toLowerCase()
-		.replaceAll(/[^a-z]+/g, '-')
-		.replaceAll(/^-+|-+$/g, '');
-}
-
-/** Three to six words. Shorter is a typo, longer is a paste accident. */
-export function isPhraseShaped(phrase: string): boolean {
-	const normalized = normalizePhrase(phrase);
-	if (!normalized) return false;
-	const words = normalized.split('-');
-	return words.length >= 3 && words.length <= 6;
-}
+/**
+ * The phrase helpers live in `words.ts`, beside the format they describe, and are re-exported here
+ * because everything that derives a room or a proof needs them.
+ *
+ * They used to be copied into this file instead, and that copy is what broke pairing: it stripped
+ * anything that was not a letter, so the moment the code grew a Crockford tail the daemon folded
+ * `2r3q` into `r-q` and derived a different room than the browser did for the very same code. Two
+ * spellings of one phrase is one spelling too many, so there is now only one.
+ */
+export { isPhraseShaped, normalizePhrase };
 
 export async function sha256Hex(text: string): Promise<string> {
 	const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
