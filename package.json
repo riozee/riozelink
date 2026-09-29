@@ -31,7 +31,6 @@
 	"devDependencies": {
 		"@types/bun": "^1.4.2",
 		"@types/ws": "^8.18.1",
-		"peer": "^1.0.2",
 		"typescript": "^7.0.2"
 	}
 }

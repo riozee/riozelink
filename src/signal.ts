@@ -1,69 +1,71 @@
 /**
- * One registration with a signaling server.
+ * One room on the relay.
  *
- * A link owns one peer id: the daemon keeps one for the pairing code and one for every browser it
- * has paired with. The server (the public PeerServer by default, or your own on a URL you choose)
- * remembers that the id is here and forwards OFFER, ANSWER and CANDIDATE frames addressed to it.
+ * A link owns one room and one socket in it. The relay forwards whatever this end sends to the other
+ * clients in the room and nothing else. It keeps no account of who is present, it answers nothing,
+ * and it never speaks first, so a link is a way to exchange introductions and little more. Once two
+ * ends have their DataChannel the relay is done with them.
  *
- * A link reconnects on its own with a little backoff, and a lost signaling connection never touches
- * a DataChannel that is already open: once two peers have met, the server is done with them.
+ * A link reconnects on its own with a little backoff, and a lost socket never touches a DataChannel
+ * that is already open.
  */
 import {
-	makeConnectionId,
-	offerPayload,
+	fitsRelayFrame,
+	makePeerId,
+	PROTOCOL_VERSION,
 	signalSocketUrl,
-	type SignalMessage,
-	type SignalPayload
+	SIGNAL_SUBPROTOCOL,
+	type RelayMessage,
+	type RelayOutgoing
 } from './protocol.ts';
 
 export interface SignalLinkOptions {
-	/** `wss://…/peerjs`. */
+	/** The relay host. */
 	base: string;
-	/** The id this link registers. Valid PeerServer ids only: letters, digits, `-` and `_`. */
-	id: string;
-	/** A frame arrived for us. `from` is the id it came from. */
-	onSignal(payload: SignalPayload, from: string): void;
-	/** The other end said goodbye, or its offer went unanswered. */
-	onPeerLeft?(from: string): void;
-	/** The registration landed. */
+	/** The room this link sits in. */
+	room: string;
+	/** A message arrived from the room. `from` is the other end's own id. */
+	onMessage(message: RelayMessage, from: string): void;
+	/** The socket opened and the room was joined. */
 	onOpen?(): void;
 	/** The socket dropped. A reconnect is already scheduled. */
 	onLost?(reason: string): void;
-	/** The id is taken: another process is already using it. */
-	onTaken?(): void;
 	log(level: 'info' | 'warn' | 'error', message: string): void;
 }
 
-/** How often we tell the server we are still here. PeerServer drops silent peers. */
-const HEARTBEAT_MS = 5000;
 const BACKOFF_MIN_MS = 1000;
 const BACKOFF_MAX_MS = 30_000;
 
+/** What a close code means, in words a log reader can act on. */
+function closeReason(code: number): string {
+	if (code === 1009) return 'a frame went over the relay limit, so it closed the socket';
+	if (code === 1000) return 'the relay closed the socket';
+	if (code === 1006) return 'the relay socket dropped';
+	return `the relay socket closed (${code})`;
+}
+
 export class SignalLink {
-	readonly id: string;
-	/** The peer we are mid-conversation with. Set by an inbound offer or by `offer()`. */
-	remoteId: string | null = null;
-	/** Tells this link's frames apart from another one's inside the same socket. */
-	readonly connectionId = makeConnectionId();
+	/** The room this link sits in. */
+	readonly room: string;
 	/**
-	 * The connection id the other end offered with. Answers and candidates carry it back, the way the
-	 * peerjs library does it, so both ends can tell one attempt from the next.
+	 * This end's own id, which is what the other end addresses its replies to. The relay assigns
+	 * nothing, so this is ours to pick, and it stays the same for the life of the link so a browser
+	 * that reconnects still knows who it is talking to.
 	 */
-	private remoteConnectionId: string | null = null;
+	readonly id = makePeerId('rz-h');
 
 	private socket: WebSocket | null = null;
 	private stopped = false;
-	private registered = false;
+	private joined = false;
 	private attempt = 0;
 	private retryTimer: NodeJS.Timeout | null = null;
-	private heartbeat: NodeJS.Timeout | null = null;
 
 	constructor(private readonly options: SignalLinkOptions) {
-		this.id = options.id;
+		this.room = options.room;
 	}
 
 	get online(): boolean {
-		return this.socket?.readyState === WebSocket.OPEN && this.registered;
+		return this.socket?.readyState === WebSocket.OPEN && this.joined;
 	}
 
 	get retrying(): boolean {
@@ -72,10 +74,10 @@ export class SignalLink {
 
 	connect(): void {
 		if (this.stopped || this.socket) return;
-		this.registered = false;
+		this.joined = false;
 		let socket: WebSocket;
 		try {
-			socket = new WebSocket(signalSocketUrl(this.options.base, this.id, String(Math.random())));
+			socket = new WebSocket(signalSocketUrl(this.options.base, this.room), [SIGNAL_SUBPROTOCOL]);
 		} catch (error) {
 			this.scheduleRetry(`could not open ${this.options.base}: ${(error as Error).message}`);
 			return;
@@ -83,7 +85,12 @@ export class SignalLink {
 		this.socket = socket;
 
 		socket.onopen = () => {
-			this.startHeartbeat();
+			this.joined = true;
+			this.attempt = 0;
+			// The relay never speaks first, so saying hello is the only way to announce this end. The
+			// host is the answering side, so it says hello and then waits.
+			this.send({ type: 'hello', protocol: PROTOCOL_VERSION });
+			this.options.onOpen?.();
 		};
 		socket.onmessage = (event) => this.handleMessage(event.data);
 		socket.onerror = () => {
@@ -91,12 +98,12 @@ export class SignalLink {
 		};
 		socket.onclose = (event) => {
 			if (this.socket !== socket) return;
-			const wasOpen = this.registered;
+			const wasJoined = this.joined;
 			this.socket = null;
-			this.registered = false;
-			this.stopHeartbeat();
-			if (wasOpen) this.options.onLost?.(`the signaling connection closed (${event.code})`);
-			if (!this.stopped) this.scheduleRetry(`the signaling connection closed (${event.code})`);
+			this.joined = false;
+			const reason = closeReason(event.code);
+			if (wasJoined) this.options.onLost?.(reason);
+			if (!this.stopped) this.scheduleRetry(reason);
 		};
 	}
 
@@ -104,126 +111,59 @@ export class SignalLink {
 		this.stopped = true;
 		if (this.retryTimer) clearTimeout(this.retryTimer);
 		this.retryTimer = null;
-		this.stopHeartbeat();
 		this.dropSocket(reason);
 	}
 
-	/** Sends the offer for this link's id. The browser end calls this. */
-	offer(dst: string, sdp: string): void {
-		this.remoteId = dst;
-		this.send(offerPayload(sdp));
+	/** Sends one message to the room. The socket fills in the room, the sender and the clock. */
+	send(message: RelayOutgoing): void {
+		this.sendRaw({ ...message, room: this.room, from: this.id, ts: Date.now() });
 	}
 
-	/** Sends whatever the peer asked for: an answer, or a candidate. */
-	send(payload: SignalPayload): void {
-		if (!this.remoteId) {
-			this.options.log('warn', 'nothing to send to — no peer has knocked yet');
+	/** Tells the room this end is leaving. Best effort: the socket may already be gone. */
+	leave(): void {
+		this.send({ type: 'bye' });
+	}
+
+	private sendRaw(message: RelayMessage): void {
+		const socket = this.socket;
+		if (!socket || socket.readyState !== WebSocket.OPEN) return;
+		const text = JSON.stringify(message);
+		// The relay answers an oversized frame by closing the socket with 1009, which would take the
+		// whole room down over one bad message. Better to drop the frame and say so.
+		if (!fitsRelayFrame(text)) {
+			this.options.log(
+				'error',
+				`a ${message.type} frame was over the relay's 64 KiB limit, so it was not sent`
+			);
 			return;
 		}
-		const dst = this.remoteId;
-		const type =
-			'sdp' in payload ? (payload.sdp.type === 'offer' ? 'OFFER' : 'ANSWER') : 'CANDIDATE';
-		this.sendRaw({
-			type,
-			dst,
-			payload: {
-				...payload,
-				connectionId: payload.connectionId ?? this.remoteConnectionId ?? this.connectionId
-			}
-		});
-	}
-
-	/** Tells the other end this link is over. Best effort: it may already be gone. */
-	leave(): void {
-		if (!this.remoteId) return;
-		this.sendRaw({ type: 'LEAVE', dst: this.remoteId });
-		this.remoteId = null;
-	}
-
-	private sendRaw(message: SignalMessage): void {
-		if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
 		try {
-			this.socket.send(JSON.stringify(message));
+			socket.send(text);
 		} catch (error) {
-			this.options.log('warn', `signaling send failed: ${(error as Error).message}`);
+			this.options.log('warn', `relay send failed: ${(error as Error).message}`);
 		}
 	}
 
 	private handleMessage(data: unknown): void {
+		// The relay forwards text and drops binary, so anything else is somebody else's protocol.
 		if (typeof data !== 'string') return;
-		let message: SignalMessage;
+		let message: RelayMessage;
 		try {
-			message = JSON.parse(data) as SignalMessage;
+			message = JSON.parse(data) as RelayMessage;
 		} catch {
 			return;
 		}
-		switch (message.type) {
-			case 'OPEN':
-				this.attempt = 0;
-				this.registered = true;
-				this.options.onOpen?.();
-				return;
-			case 'ID-TAKEN':
-				this.options.log(
-					'error',
-					`the signaling server already knows a peer with the id ${this.id}`
-				);
-				this.options.onTaken?.();
-				this.close('id taken');
-				return;
-			case 'INVALID-KEY':
-			case 'ERROR':
-				this.options.log(
-					'error',
-					`the signaling server refused us: ${(message.payload as { msg?: string })?.msg ?? 'no reason given'}`
-				);
-				this.close('refused');
-				return;
-			case 'EXPIRE':
-				this.options.log('warn', 'the offer expired before it was answered');
-				this.options.onPeerLeft?.(message.src ?? '');
-				return;
-			case 'LEAVE':
-				this.options.onPeerLeft?.(message.src ?? '');
-				return;
-			case 'HEARTBEAT':
-				// A reply to ours, or the server checking on us. Either way: say we are here.
-				this.sendRaw({ type: 'HEARTBEAT' });
-				return;
-			case 'OFFER':
-			case 'ANSWER':
-			case 'CANDIDATE': {
-				const from = message.src;
-				const payload = message.payload as SignalPayload | undefined;
-				if (!from || !payload || typeof payload !== 'object') return;
-				if (message.type === 'OFFER') {
-					this.remoteId = from;
-					this.remoteConnectionId = payload.connectionId ?? null;
-				}
-				this.options.onSignal(payload, from);
-				return;
-			}
-			default:
-				return;
-		}
-	}
-
-	private startHeartbeat(): void {
-		this.stopHeartbeat();
-		this.heartbeat = setInterval(() => this.sendRaw({ type: 'HEARTBEAT' }), HEARTBEAT_MS);
-		this.heartbeat.unref?.();
-	}
-
-	private stopHeartbeat(): void {
-		if (this.heartbeat) clearInterval(this.heartbeat);
-		this.heartbeat = null;
+		if (!message || typeof message.type !== 'string' || typeof message.from !== 'string') return;
+		// The relay does not echo, but a room can hold more than two ends and this is cheap.
+		if (message.from === this.id) return;
+		if (message.to && message.to !== this.id) return;
+		this.options.onMessage(message, message.from);
 	}
 
 	private dropSocket(reason: string): void {
 		const socket = this.socket;
 		this.socket = null;
-		this.registered = false;
-		this.stopHeartbeat();
+		this.joined = false;
 		if (socket && socket.readyState <= WebSocket.OPEN) {
 			try {
 				socket.close(1000, reason);
@@ -238,7 +178,7 @@ export class SignalLink {
 		const delay = Math.min(BACKOFF_MAX_MS, BACKOFF_MIN_MS * 2 ** this.attempt);
 		this.attempt = Math.min(this.attempt + 1, 6);
 		const wait = delay + Math.floor(Math.random() * 500);
-		this.options.log('info', `${reason}; trying again in ${(wait / 1000).toFixed(1)}s`);
+		this.options.log('info', `${reason}. Trying the room again in ${(wait / 1000).toFixed(1)}s`);
 		this.retryTimer = setTimeout(() => {
 			this.retryTimer = null;
 			this.connect();

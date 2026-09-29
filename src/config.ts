@@ -11,7 +11,7 @@ import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import path from 'node:path';
 import { homedir } from 'node:os';
-import { DEFAULT_SIGNAL_URL, type AiProvider } from './protocol.ts';
+import type { AiProvider } from './protocol.ts';
 import { slugify } from './util.ts';
 
 export interface ShareRecord {
@@ -43,11 +43,6 @@ export interface AuthorizedClient {
 export interface HostConfig {
 	version: 1;
 	hostName: string;
-	/**
-	 * The signaling server both ends dial out to. Any PeerServer speaks it: the public cloud,
-	 * `npx peerjs` on this machine, or the one you host later.
-	 */
-	signal: string;
 	folders: Record<string, ShareRecord>;
 	anki: AnkiConfig;
 	ai: AiConfig;
@@ -82,7 +77,6 @@ export function defaultConfig(): HostConfig {
 	return {
 		version: CONFIG_VERSION,
 		hostName: hostname(),
-		signal: DEFAULT_SIGNAL_URL,
 		folders: {},
 		anki: { enabled: false, port: 8765 },
 		ai: {
@@ -110,9 +104,6 @@ export function normalizeConfig(raw: unknown): HostConfig {
 
 	if (typeof raw.hostName === 'string' && raw.hostName.trim())
 		config.hostName = raw.hostName.trim();
-	if (typeof raw.signal === 'string' && /^wss?:\/\//.test(raw.signal.trim())) {
-		config.signal = raw.signal.trim();
-	}
 
 	if (isRecord(raw.folders)) {
 		for (const [id, value] of Object.entries(raw.folders)) {

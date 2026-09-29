@@ -154,7 +154,6 @@ export class Dashboard {
 		lines.push(
 			`${this.paint(`RIozeLink ${host.hostVersion}`, 'bold')} ${this.paint('· listening', 'green')}`
 		);
-		lines.push(`${this.paint('signal   ', 'dim')} ${this.paint(host.signalUrl(), 'dim')}`);
 		lines.push(`${this.paint('code     ', 'dim')} ${codeLine}`);
 		lines.push(`${this.paint('clients  ', 'dim')} ${state}`);
 		const shares = Object.entries(host.shares());

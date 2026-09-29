@@ -7,7 +7,7 @@
  *
  * Four words out of this list are about 36 bits, and the tail adds 20 more, so a code is about 56
  * bits. That is what makes the room name safe to publish. The room is stretched out of the code
- * with PBKDF2 rather than hashed from it, so a signaling server that reads the room name still
+ * with PBKDF2 rather than hashed from it, so a relay that reads the room name still
  * cannot walk the code space at hash speed.
  *
  * The list is short on purpose. Every word is lowercase, spelled the way it sounds, and free of

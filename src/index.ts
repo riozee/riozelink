@@ -3,8 +3,9 @@
  * The command line. `riozelink` starts the daemon; the other commands edit the config file without
  * a daemon running, which is what a setup script or a curious user wants.
  *
- * There is no `relay` command and no server to deploy: signaling is a public PeerServer by
- * default, and `--signal` points both ends at your own when you want one.
+ * There is no `relay` command and no server to deploy: the relay is one fixed host that every
+ * installation shares, and its address is not a setting. A meeting point is only as good as the
+ * machine it runs on, so there is nothing a flag here would let a user usefully choose.
  *
  * Minting a pairing code is deliberately not a command here. It is runtime state rather than
  * configuration, and the only things that mint one are the daemon's own panel and its own signal
@@ -16,7 +17,6 @@ import path from 'node:path';
 import { configFilePath, loadConfig, saveConfig, uniqueShareId } from './config.ts';
 import { Dashboard } from './dashboard.ts';
 import { HOST_VERSION, RiozeLinkHost } from './host.ts';
-import { DEFAULT_SIGNAL_URL } from './protocol.ts';
 import { displayPath, maskKey, truncate } from './util.ts';
 import { displayPhrase } from './words.ts';
 
@@ -79,36 +79,32 @@ Usage
   riozelink --version
 
 Serve options
-  --signal <url>                    the meeting point (default ${DEFAULT_SIGNAL_URL})
   --config-dir <path>               where config.json and identity.json live
   --stun <url>[,<url>]              STUN servers for the WebRTC candidates
   --quiet                           print the code once, then only log lines
 
-The daemon never listens on a port. It registers a peer id on a signaling server and waits,
-so a browser anywhere can meet it. That server is a public PeerServer by default; run
-"npx peerjs --port 9000" and pass --signal ws://your-host:9000/peerjs to use your own. No
-TURN server is involved, which is the one limitation worth knowing: on a hostile network the
-peers may not be able to reach each other at all.
+The daemon never listens on a port. It joins a room on the relay that both ends know how to
+name, and waits there, so a browser anywhere can meet it and nobody has to type an address.
+The relay carries introductions only, and no TURN server is involved anywhere, which is the
+one limitation worth knowing: on a hostile network the peers may not be able to reach each
+other at all.
 
 A pairing code is four words and four characters, and it is minted rather than standing. One
 is made at startup and lives for three minutes. Press n on the panel for another, or send
-SIGUSR2 when there is no panel to press. Once a code expires or a browser uses it, the room
-it named comes off the signaling server and the daemon is left registered only under the ids
-it shares with browsers it already knows.
+SIGUSR2 when there is no panel to press. Once a code expires or a browser uses it, the daemon
+leaves that room and sits only in the rooms it shares with browsers it already knows.
 `);
 }
 
 async function serve(args: ParsedArgs): Promise<void> {
 	const quiet = args.flags.get('quiet') === true;
 	const configDir = flagString(args, 'config-dir');
-	const signal = flagString(args, 'signal');
 	const stun = flagString(args, 'stun')
 		?.split(',')
 		.map((url) => url.trim())
 		.filter(Boolean);
 	const host = await RiozeLinkHost.create({
 		configDir,
-		signal,
 		iceServers: stun,
 		// A quiet daemon has no panel, so its lines go straight out. A service that reports nothing
 		// is a service nobody can diagnose.
@@ -132,7 +128,6 @@ async function serve(args: ParsedArgs): Promise<void> {
 	if (quiet) {
 		const code = host.pairingCode();
 		const hint = process.platform === 'win32' ? 'restart the daemon' : 'send SIGUSR2';
-		process.stdout.write(`signal ${host.signalUrl()}\n`);
 		process.stdout.write(code ? `code ${displayPhrase(code)}\n` : `code none, ${hint} for one\n`);
 	}
 
@@ -245,7 +240,6 @@ async function status(): Promise<void> {
 	const config = await loadConfig(configFilePath());
 	process.stdout.write(`config    ${displayPath(configFilePath())}\n`);
 	process.stdout.write(`host      ${config.hostName}\n`);
-	process.stdout.write(`signal    ${config.signal}\n`);
 	const shares = Object.entries(config.folders);
 	process.stdout.write(`shares    ${shares.length}\n`);
 	for (const [id, share] of shares) {

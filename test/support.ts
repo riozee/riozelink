@@ -1,29 +1,27 @@
 /**
- * Test-side pieces: a minimal RiozeOS client, a real signaling server, and two fake services.
+ * Test-side pieces: a minimal RiozeOS client, a real relay, and two fake services.
  *
  * The client speaks the same protocol the browser app does, with werift standing in for the
- * browser's WebRTC and the `peer` dev dependency standing in for 0.peerjs.com. That is the point
+ * browser's WebRTC and a local room relay standing in for signal.rioze.dev. That is the point
  * of the exercise: if the daemon satisfies this, it will satisfy the real client, because both
  * sides only ever meet at `protocol.ts`.
  */
-import type { Server } from 'node:http';
-import { PeerServer } from 'peer';
+import type { ServerWebSocket } from 'bun';
 import { RTCPeerConnection, type RTCDataChannel } from 'werift';
 import { fingerprintOfPublicKey } from '../src/identity.ts';
 import {
-	candidatePayload,
-	isOfferPayload,
-	linkId,
-	makeSignalId,
-	offerPayload,
+	linkRoom,
+	makePeerId,
 	pairProof,
 	PROTOCOL_VERSION,
+	SIGNAL_MAX_FRAME,
+	SIGNAL_SUBPROTOCOL,
 	signalSocketUrl,
 	type AuthHelloReply,
 	type AuthOkPayload,
-	type RpcWire,
-	type SignalMessage,
-	type SignalPayload
+	type RelayMessage,
+	type RelayOutgoing,
+	type RpcWire
 } from '../src/protocol.ts';
 import { fromBase64, randomNonce, toBase64 } from '../src/util.ts';
 
@@ -36,19 +34,74 @@ const OFFER_RETRY_MS = 2000;
 const OFFER_ATTEMPTS = 8;
 
 /**
- * A signaling server of the tests' own: the real PeerServer package, on a loopback port nothing
- * else is using. The daemon and the test client both only see a URL.
+ * A relay of the tests' own: the same shape as the one RiozeLink meets, on a loopback port.
+ *
+ * A room is the set of sockets joined to it, a text frame goes to every other socket in that room
+ * and to nobody else, and the door is the subprotocol. That is the whole contract the daemon and
+ * the client are written against, so this is the whole contract worth reproducing.
  */
 export async function startTestSignal(): Promise<{ url: string; close(): Promise<void> }> {
-	const http = await new Promise<Server>((resolve) => {
-		PeerServer({ port: 0, host: '127.0.0.1', path: '/' }, (server) => resolve(server));
+	const rooms = new Map<string, Set<ServerWebSocket<{ room: string }>>>();
+	const server = Bun.serve<{ room: string }>({
+		port: 0,
+		hostname: '127.0.0.1',
+		fetch(request, self) {
+			const url = new URL(request.url);
+			if (url.pathname !== '/ws') return new Response('Not Found', { status: 404 });
+			// The door is checked before anything else, exactly as the relay checks it: a socket that
+			// did not ask for the subprotocol is not told the difference between a wrong door and no
+			// door at all.
+			const offered = (request.headers.get('sec-websocket-protocol') ?? '')
+				.split(',')
+				.map((value) => value.trim());
+			if (!offered.includes(SIGNAL_SUBPROTOCOL))
+				return new Response('Not Found', { status: 404 });
+			const room = (url.searchParams.get('room') ?? '').trim();
+			if (!room || room.length > 64) return new Response('Bad Request', { status: 400 });
+			if (
+				self.upgrade(request, {
+					data: { room },
+					headers: { 'Sec-WebSocket-Protocol': SIGNAL_SUBPROTOCOL }
+				})
+			)
+				return undefined as unknown as Response;
+			return new Response('Upgrade Required', { status: 426 });
+		},
+		websocket: {
+			open(socket) {
+				let members = rooms.get(socket.data.room);
+				if (!members) {
+					members = new Set();
+					rooms.set(socket.data.room, members);
+				}
+				members.add(socket);
+			},
+			message(socket, payload) {
+				// Text only. A binary frame is dropped outright, and an oversized one closes the socket
+				// with 1009, both of which the real relay does too.
+				if (typeof payload !== 'string') return;
+				if (Buffer.byteLength(payload, 'utf8') > SIGNAL_MAX_FRAME) {
+					socket.close(1009, 'message exceeds the 64 KiB relay limit');
+					return;
+				}
+				const members = rooms.get(socket.data.room);
+				if (!members) return;
+				// Verbatim, to everyone else, and never back to the sender.
+				for (const peer of members) if (peer !== socket) peer.send(payload);
+			},
+			close(socket) {
+				const members = rooms.get(socket.data.room);
+				if (!members) return;
+				members.delete(socket);
+				if (members.size === 0) rooms.delete(socket.data.room);
+			}
+		}
 	});
-	const address = http.address();
-	if (!address || typeof address === 'string')
-		throw new Error('the test signal server has no port');
 	return {
-		url: `ws://127.0.0.1:${address.port}`,
-		close: () => new Promise<void>((resolve) => http.close(() => resolve()))
+		url: `ws://127.0.0.1:${server.port}`,
+		close: async () => {
+			await server.stop(true);
+		}
 	};
 }
 
@@ -81,31 +134,31 @@ export interface TestEvent {
  * never applied that answer, and the host's peer is now the only thing standing between this
  * browser and its next attempt. A new attempt has to be able to push past it.
  */
-export async function offerAndStall(
-	signalUrl: string,
-	targetId: string
-): Promise<{ close(): void }> {
-	const signalId = makeSignalId();
-	const connectionId = `stall-${Math.random().toString(16).slice(2, 10)}`;
-	const socket = new WebSocket(signalSocketUrl(signalUrl, signalId, `${Math.random()}`));
+export async function offerAndStall(signalUrl: string, room: string): Promise<{ close(): void }> {
+	const id = makePeerId('rz-c');
+	const socket = new WebSocket(signalSocketUrl(signalUrl, room), [SIGNAL_SUBPROTOCOL]);
 	const peer = new RTCPeerConnection({ iceAdditionalHostAddresses: ['127.0.0.1'] });
 	peer.createDataChannel('rioze', { ordered: true });
 	await new Promise<void>((resolve, reject) => {
-		const timer = setTimeout(() => reject(new Error('the stalled client never registered')), 8000);
-		socket.onmessage = (event) => {
-			const message = JSON.parse(String(event.data)) as { type?: string };
-			if (message.type !== 'OPEN') return; // Every answer is deliberately dropped.
+		const timer = setTimeout(() => reject(new Error('the stalled client never joined')), 8000);
+		socket.onopen = () => {
 			clearTimeout(timer);
 			resolve();
+		};
+		socket.onerror = () => {
+			clearTimeout(timer);
+			reject(new Error('the stalled client could not join'));
 		};
 	});
 	const description = await peer.createOffer();
 	await peer.setLocalDescription({ type: 'offer', sdp: description.sdp });
 	socket.send(
 		JSON.stringify({
-			type: 'OFFER',
-			dst: targetId,
-			payload: offerPayload(description.sdp ?? '', connectionId)
+			type: 'offer',
+			room,
+			from: id,
+			ts: Date.now(),
+			sdp: description.sdp ?? ''
 		})
 	);
 	return {
@@ -127,12 +180,12 @@ export async function offerAndStall(
 export class TestClient {
 	static async connect(
 		signalUrl: string,
-		targetId: string,
+		room: string,
 		options: { name?: string; keyPair?: CryptoKeyPair } = {}
 	): Promise<TestClient> {
 		const client = new TestClient();
 		client.name = options.name ?? 'Test Browser';
-		client.targetId = targetId;
+		client.room = room;
 		client.keyPair =
 			options.keyPair ?? (await crypto.subtle.generateKey(KEY_PARAMS, true, ['sign', 'verify']));
 		const spki = await crypto.subtle.exportKey('spki', client.keyPair.publicKey);
@@ -144,47 +197,39 @@ export class TestClient {
 			client.onText(typeof data === 'string' ? data : data.toString('utf8'));
 		});
 
-		const socket = new WebSocket(signalSocketUrl(signalUrl, client.signalId, `${Math.random()}`));
+		const socket = new WebSocket(signalSocketUrl(signalUrl, room), [SIGNAL_SUBPROTOCOL]);
 		client.socket = socket;
 		socket.onmessage = (event) => void client.onSignalMessage(String(event.data));
-		const registered = new Promise<void>((resolve, reject) => {
-			client.onRegistered = resolve;
-			client.onSignalFailure = reject;
-			setTimeout(() => reject(new Error('the signaling server never registered us')), 8000);
-		});
 		await new Promise<void>((resolve, reject) => {
-			const timer = setTimeout(() => reject(new Error('the signaling socket did not open')), 8000);
+			const timer = setTimeout(() => reject(new Error('the relay socket did not open')), 8000);
 			socket.onopen = () => {
 				clearTimeout(timer);
 				resolve();
 			};
 			socket.onerror = () => {
 				clearTimeout(timer);
-				reject(new Error('the signaling socket failed'));
+				reject(new Error('the relay refused the socket'));
 			};
 		});
-		await registered;
 
 		client.peer.onIceCandidate.subscribe((candidate) => {
 			if (!candidate) return;
+			const json = candidate.toJSON();
 			client.send({
-				type: 'CANDIDATE',
-				dst: targetId,
-				payload: candidatePayload(candidate.toJSON(), client.connectionId)
+				type: 'candidate',
+				to: client.remoteId,
+				candidate: json.candidate,
+				sdpMid: json.sdpMid ?? null,
+				sdpMLineIndex: json.sdpMLineIndex ?? null
 			});
 		});
 
-		// A server queues frames for an id that is not registered yet and drops the queue after a
-		// few seconds, so an offer that arrived too early is simply offered again. The real client
-		// retries the same way.
+		// The relay holds nothing, so a room nobody is in yet simply swallows what was sent to it.
+		// An offer that arrived too early is offered again, which is what the real client does too.
 		const offer = async (): Promise<void> => {
 			const description = await client.peer.createOffer();
 			await client.peer.setLocalDescription({ type: 'offer', sdp: description.sdp });
-			client.send({
-				type: 'OFFER',
-				dst: targetId,
-				payload: offerPayload(description.sdp ?? '', client.connectionId)
-			});
+			client.send({ type: 'offer', sdp: description.sdp ?? '' });
 		};
 		await offer();
 		const answered = withTimeout(
@@ -213,7 +258,6 @@ export class TestClient {
 			CHANNEL_TIMEOUT_MS,
 			'the data channel'
 		);
-		client.startHeartbeat();
 		return client;
 	}
 
@@ -222,17 +266,15 @@ export class TestClient {
 	name = 'Test Browser';
 	publicKey = '';
 	keyPair!: CryptoKeyPair;
-	/** This client's own peer id on the signaling server. */
-	readonly signalId = makeSignalId();
-	readonly connectionId = `test-${Math.random().toString(16).slice(2, 10)}`;
+	/** This client's own id inside the room. The relay assigns nothing, so the id is ours to pick. */
+	readonly id = makePeerId('rz-c');
+	/** The other end's id, learned from the first frame it addresses to us. */
+	remoteId: string | undefined;
 
-	private targetId = '';
+	private room = '';
 	private peer!: RTCPeerConnection;
 	private channel!: RTCDataChannel;
 	private socket!: WebSocket;
-	private heartbeat: NodeJS.Timeout | null = null;
-	private onRegistered: (() => void) | null = null;
-	private onSignalFailure: ((error: Error) => void) | null = null;
 	private sawAnswer: (() => void) | null = null;
 	private readonly pending = new Map<string, (message: RpcWire & { kind: 'res' }) => void>();
 	private readonly waiters: Array<{
@@ -242,58 +284,39 @@ export class TestClient {
 	}> = [];
 	private seq = 0;
 
-	private send(message: SignalMessage): void {
-		this.socket.send(JSON.stringify(message));
-	}
-
-	private startHeartbeat(): void {
-		this.heartbeat = setInterval(() => {
-			if (this.socket.readyState === WebSocket.OPEN)
-				this.socket.send(JSON.stringify({ type: 'HEARTBEAT' }));
-		}, 5000);
+	private send(message: RelayOutgoing): void {
+		this.socket.send(JSON.stringify({ ...message, room: this.room, from: this.id, ts: Date.now() }));
 	}
 
 	private async onSignalMessage(text: string): Promise<void> {
-		let message: SignalMessage;
+		let message: RelayMessage;
 		try {
-			message = JSON.parse(text) as SignalMessage;
+			message = JSON.parse(text) as RelayMessage;
 		} catch {
 			return;
 		}
-		switch (message.type) {
-			case 'OPEN':
-				this.onRegistered?.();
-				return;
-			case 'HEARTBEAT':
-				this.socket.send(JSON.stringify({ type: 'HEARTBEAT' }));
-				return;
-			case 'ID-TAKEN':
-			case 'INVALID-KEY':
-			case 'ERROR':
-				this.onSignalFailure?.(new Error(`the signaling server refused us: ${message.type}`));
-				return;
-			case 'ANSWER':
-			case 'CANDIDATE': {
-				const payload = message.payload as SignalPayload | undefined;
-				if (!payload) return;
-				if (isOfferPayload(payload)) {
-					await this.peer.setRemoteDescription({ type: 'answer', sdp: payload.sdp.sdp });
-					this.sawAnswer?.();
-					return;
-				}
-				if (!payload.candidate) {
-					await this.peer.addIceCandidate(null);
-					return;
-				}
-				await this.peer.addIceCandidate({
-					candidate: payload.candidate.candidate,
-					sdpMid: payload.candidate.sdpMid,
-					sdpMLineIndex: payload.candidate.sdpMLineIndex
-				});
+		// The relay does not echo, and a room is meant to hold two ends, so anything sent by a
+		// bystander or addressed elsewhere is not this handshake's business.
+		if (!message.type || !message.from || message.from === this.id) return;
+		if (message.to && message.to !== this.id) return;
+		if (this.remoteId && message.from !== this.remoteId) return;
+		if (message.type === 'answer') {
+			this.remoteId = message.from;
+			await this.peer.setRemoteDescription({ type: 'answer', sdp: message.sdp ?? '' });
+			this.sawAnswer?.();
+			return;
+		}
+		if (message.type === 'candidate') {
+			this.remoteId ??= message.from;
+			if (!message.candidate) {
+				await this.peer.addIceCandidate(null);
 				return;
 			}
-			default:
-				return;
+			await this.peer.addIceCandidate({
+				candidate: message.candidate,
+				sdpMid: message.sdpMid ?? undefined,
+				sdpMLineIndex: message.sdpMLineIndex ?? undefined
+			});
 		}
 	}
 
@@ -419,16 +442,15 @@ export class TestClient {
 		return (await this.call('auth', 'prove', { signature })) as AuthOkPayload;
 	}
 
-	/** The peer id this client and the host meet at after pairing. No words needed, ever again. */
+	/** The room this client and the host meet in after pairing. No words needed, ever again. */
 	async idForReconnect(): Promise<string> {
 		if (!this.helloReply) throw new Error('hello first');
 		const hostHex = fingerprintOfPublicKey(this.helloReply.publicKey).fingerprintHex;
 		const ownHex = fingerprintOfPublicKey(this.publicKey).fingerprintHex;
-		return linkId(hostHex, ownHex);
+		return linkRoom(hostHex, ownHex);
 	}
 
 	close(): void {
-		if (this.heartbeat) clearInterval(this.heartbeat);
 		try {
 			this.channel.close();
 		} catch {

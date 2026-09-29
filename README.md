@@ -7,9 +7,8 @@ English · [日本語](README.ja.md)
 RiozeLink is a small daemon you run on your own computer. It opens one private, encrypted link to
 riozeOS in the browser, and over that link RiozeOS can browse folders you chose to share, talk to
 AnkiConnect, and send AI chats through Ollama or an OpenAI-compatible endpoint with your own key.
-Nothing needs an account, and nothing needs a port to be open on your router. The daemon registers a
-name with a signaling server, the same way the `peerjs` library does, and waits for your browser to
-walk in.
+Nothing needs an account, and nothing needs a port to be open on your router. The daemon joins a room
+on a relay that both ends know how to name, and waits there for your browser to walk in.
 
 ```text
  your computer                          the browser
@@ -20,7 +19,7 @@ walk in.
 │  API key (0600)      │      ▲       │   AI panel           │
 └──────────────────────┘      │       └──────────────────────┘
                               │                    riozeOS app
-                 a signaling server introduces the two once
+                 a relay introduces the two once
                  (a pairing code, then never again)
 ```
 
@@ -79,8 +78,7 @@ The terminal paints a small panel with everything the next step needs.
 
 ```text
 RIozeLink 0.3.0 · listening
-signal   wss://0.peerjs.com/peerjs
-words    amber-cobalt-summit-drift (14m 03s left)
+code     HONEST LOBSTER BANANA DUNE 6YRB (2m 41s left)
 clients  no clients yet
 shares   none yet
 config   ~/.config/riozelink/config.json
@@ -99,14 +97,13 @@ sure of it. If the code has lapsed, press `n` on the panel for a fresh one.
 
 What happens under the hood, in order:
 
-1. The code names a meeting point. Both the daemon and the browser stretch it with PBKDF2 into the
-   same peer id and register with the signaling server under it. The server sees that id and never
-   the code, and working back from the id to the code costs a hundred thousand rounds per guess
-   rather than one hash.
+1. The code names a room. Both the daemon and the browser stretch it with PBKDF2 into the same room
+   name, and each joins it on the relay. The relay sees that name and never the code, and working
+   back from the name to the code costs a hundred thousand rounds per guess rather than one hash.
 2. The browser generates an ECDSA P-256 key pair and keeps the private half non-extractable in
    IndexedDB. It never leaves the browser.
-3. The two sides swap a WebRTC offer and answer through the server. This is only an introduction.
-   The conversation itself runs over the DataChannel, encrypted by DTLS, and the server is done
+3. The two sides swap a WebRTC offer and answer through the relay. This is only an introduction.
+   The conversation itself runs over the DataChannel, encrypted by DTLS, and the relay is done
    with you.
 4. Over that channel the browser sends `auth:hello`. The daemon answers with its own public key, a
    nonce, and a signature over the browser's nonce. The client verifies it, so it knows it found
@@ -127,7 +124,7 @@ Every read and write you make there lands on the folder you picked.
 ### Reconnecting
 
 Open the app in riozeOS and press Connect. There is nothing to type. The browser and the daemon
-register under a name made of both their fingerprints, a name only those two can compute, and the
+join a room named by both their fingerprints, a name only those two can compute, and the
 browser proves itself with the key it stored during pairing. The daemon's identity survives
 restarts, the browser remembers its fingerprint from the first pairing, and a different machine
 under that name is refused.
@@ -200,7 +197,6 @@ anything unreadable falls back to its default rather than breaking the daemon.
 {
 	"version": 1,
 	"hostName": "rioze-macbook",
-	"signal": "wss://0.peerjs.com/peerjs",
 	"folders": {
 		"notes": { "label": "Notes", "path": "/Users/rioze/Notes" }
 	},
@@ -232,9 +228,8 @@ their hands off a real home directory.
 | Command                                         | What it does                                               |
 | ----------------------------------------------- | ---------------------------------------------------------- |
 | `riozelink`                                     | Starts the daemon and the terminal panel.                  |
-| `riozelink --signal ws://host:9000`             | Meets the browser somewhere other than the default server. |
 | `riozelink --stun stun:stun.l.google.com:19302` | Adds STUN servers, for links behind stubborn NATs.         |
-| `riozelink --quiet`                             | Prints the words once, then only log lines.                |
+| `riozelink --quiet`                             | Prints the code once, then only log lines.                 |
 | `riozelink folders list`                        | Shows the shared folders.                                  |
 | `riozelink folders add <path> [--label Notes]`  | Shares a folder.                                           |
 | `riozelink folders remove <id>`                 | Stops sharing one.                                         |
@@ -242,24 +237,31 @@ their hands off a real home directory.
 | `riozelink clients revoke <name>`               | Forgets one, name and all.                                 |
 | `riozelink status`                              | A summary of the config file, clients included.            |
 
-On the panel, `n` mints a pairing code, `h` shows the first-connection notes, and `q` stops
-the daemon. A daemon running with no panel does the same job on `SIGUSR2`.
+On the panel, `n` mints a pairing code, `h` shows the first-connection notes, and `q` stops the
+daemon. A daemon running with no panel does the same job on `SIGUSR2`.
 
 ## The meeting point
 
 Two ends have to be introduced before WebRTC can take over, and neither can be asked for an address.
-So the daemon registers a name with a signaling server and waits there. A browser holding the four
-words hashes them into the same name, registers itself, and offers to it. The server forwards the
-offer, the answer and the ICE candidates, and once the two are talking directly it is out of the
-picture. Reconnecting later needs no words at all, because the name both sides compute from their
-fingerprints is one nobody else can guess.
+So both ends join a *room* on a relay and talk to whoever else is in it. A browser holding the four
+words derives the same room name the daemon did, joins it, and offers into it. Reconnecting later
+needs no words at all, because the room both sides compute from their fingerprints is one nobody
+else can name.
 
-The default is `wss://0.peerjs.com/peerjs`, the public PeerServer cloud that the `peerjs` library
-uses itself. There is nothing to sign up for, and it only ever carries introductions. Running your
-own takes one command and no code. Run `npx peerjs --port 9000` on a machine both ends can reach,
-then start the daemon with `riozelink --signal ws://your-host:9000` and type the same address into
-the app's _Meeting point_ field. The panel and the Overview tab both name the server in use, so the
-two ends can be checked against each other at a glance.
+The relay is `wss://signal.rioze.dev`, one fixed machine that every installation shares. It is not a
+setting, and there is no flag, field or file that can point a daemon somewhere else. Writing one was
+tempting, and leaving it out is the better answer. A meeting point has value only while both ends
+can reach it, and the reason a link works the first time is that nobody has to agree on where to
+meet. The app and the panel therefore say nothing about it, because there is nothing about it to get
+wrong.
+
+Two ends in a room address each other rather than guessing. The relay hands each frame to everyone
+in the room except the sender, and it never says who is in there, so `from` says who sent it and
+`to` says who it is for. That is enough for a handshake, and it is all the relay ever learns.
+
+Two rules come with it. Frames are text, capped at 64 KiB of UTF-8, and a frame over that cap closes
+the socket with `1009`. A closed socket is a lost link, so both ends check the size before sending
+and drop a frame that would not fit instead of taking the room down over it.
 
 One honest limitation. There is no TURN server anywhere in this setup. TURN is the piece that
 carries the traffic itself when two peers cannot find a direct path to each other, which is what
@@ -277,7 +279,7 @@ this design that costs money to run.
 | Piece         | Where it lives                 | What it does                                                                                                                 |
 | ------------- | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
 | The code      | `src/words.ts`                 | 534 plain words and Crockford's 32 characters. Four of each, about 56 bits, no confusable pairs.                             |
-| Signaling     | `src/signal.ts`                | One registration per peer id, heartbeats, reconnects with backoff.                                                           |
+| The relay     | `src/signal.ts`                | One socket per room, frames taken verbatim, reconnects with backoff.                                                        |
 | WebRTC link   | `src/peer.ts`                  | Answers the browser's offer, trickles candidates, hands over the DataChannel.                                                |
 | Auth          | `src/session.ts`               | Hello, proof, pairing. Every other message waits behind it.                                                                  |
 | Filesystem    | `src/vfs.ts`, `src/sandbox.ts` | Path fence, chunked reads and writes, part files, change watching.                                                           |
@@ -322,10 +324,10 @@ The daemon generates its own ECDSA P-256 key pair on first start, in `identity.j
 pins the fingerprint it sees during the first pairing and re-checks it on every connection, which is
 why a different machine cannot quietly take over.
 
-Returning needs no code because the name both ends register under is proof enough of who belongs
-there. They hash their two public fingerprints together, and only those two can arrive at that
-name. The daemon holds one such registration per paired browser and nothing else, so a client it has
-never met has nowhere to knock.
+Returning needs no code because the room both ends join is proof enough of who belongs there. They
+hash their two public fingerprints together, and only those two can arrive at that name. The daemon
+sits in one such room per paired browser and nothing else, so a client it has never met has nowhere
+to knock.
 
 ### The pairing code
 
@@ -334,20 +336,20 @@ The words are about 36 bits and the tail adds 20 more, and the alphabet leaves o
 `U`, so the two characters a person actually confuses, `O` with `0` and `I` with `1`, can never both
 appear. It is short enough to read off a terminal and type on a phone without going back to check.
 
-The code does three jobs at once. It is what a person reads, it names the meeting point, and it is
-the secret that proves the person was at that terminal.
+The code does three jobs at once. It is what a person reads, it names the room, and it is the secret
+that proves the person was at that terminal.
 
 The proof is an HMAC through a PBKDF2-stretched key, so the code itself never crosses the wire in
 either direction. The room name gets the same treatment, and that one matters more than it looks.
-The room name is the single thing here that gets published, because the daemon registers it as a
-peer id and that puts it in the connection string the signaling server reads. A plain hash at that
-spot would let whoever read the id test the whole code space offline at hash speed. Stretching it
-costs the same hundred thousand rounds, once per connection, which is affordable.
+The room name is the single thing here that gets published, because the daemon writes it into the
+socket URL the relay reads. A plain hash at that spot would let whoever read the name test the whole
+code space offline at hash speed. Stretching it costs the same hundred thousand rounds, once per
+connection, which is affordable.
 
 A code is minted, never standing. One is made at startup and one whenever you ask for another, it
 lives for three minutes, and nothing renews it. Ten wrong tries spend it early, and it retires the
-moment a browser pairs with it. Between those moments the daemon is registered only under the ids it
-shares with browsers it already knows, so there is no room for a stranger to find and nothing worth
+moment a browser pairs with it. Between those moments the daemon sits only in the rooms it shares
+with browsers it already knows, so there is nothing for a stranger to find and nothing worth
 guessing at while nobody is being let in.
 
 Asking for another one means pressing `n` on the panel, or sending `SIGUSR2` to the daemon when
@@ -372,10 +374,10 @@ rename shows up as a removal and a creation, which is true from where the client
 ## Security, honestly
 
 The link is private by construction. The DataChannel is encrypted with DTLS between the two peers,
-so the signaling server only ever carries introductions. Every session has to pass the auth exchange
-before any other message is answered, and both sides sign a nonce the other side chose, so a replay
-or a machine-in-the-middle does not get in. A pairing also has to prove the code, which is what
-stops someone who wandered into the right meeting point.
+so the relay only ever carries introductions. Every session has to pass the auth exchange before any
+other message is answered, and both sides sign a nonce the other side chose, so a replay or a
+machine-in-the-middle does not get in. A pairing also has to prove the code, which is what stops
+someone who wandered into the right room.
 
 What the daemon will never do, no matter who asks:
 
@@ -390,9 +392,10 @@ What is worth knowing:
   is also reach. Revoke a client with `riozelink clients revoke <name>` and restart the daemon.
 - The pairing code is a secret while it lasts, and it does not last long. Pair from a terminal you
   are looking at, and do not read the code out to anyone you would not hand a key to.
-- The signaling server sees that two connections met under some name. It does not see the code, the
-  files, the chats, or the keys. It is somebody else's machine by default, so treat it as one more
-  party that can watch introductions and run your own when you would rather it did not.
+- The relay sees that two connections met in some room. It does not see the code, the files, the
+  chats, or the keys, and it never learns who else is in the room with them. It is someone else's
+  machine, so treat it as one more party that can watch introductions, and know that the room name
+  it reads is a stretched one and not the code.
 - The config file holds your API key in plain text. It is written with permissions for your user
   only, which protects it from other accounts, not from you.
 
@@ -402,10 +405,9 @@ What is worth knowing:
 retires the moment another device uses it. Look at the panel. If that line says none, press `n` for
 a fresh one, then try the code it shows.
 
-**Nothing happens when the code is typed.** The two ends meet on a signaling server. If the daemon
-cannot reach `wss://0.peerjs.com/peerjs`, check its log for a retry line. If you run your own, make
-sure both ends were told the same address. The panel and the app's Overview tab both say which
-server is in use.
+**Nothing happens when the code is typed.** The two ends meet in a room on a relay. If the daemon
+cannot reach `wss://signal.rioze.dev`, check its log for a retry line. A relay that is briefly
+unreachable is the usual reason, and the daemon comes back to it on its own.
 
 **The app says the channel did not open.** The two peers found each other but could not build a
 direct path, which usually means both networks are behind symmetric NAT or carrier-grade NAT, and
@@ -425,9 +427,9 @@ default.
 **A file operation answers `permission` or `denied`.** The path left the shared folder, possibly
 through a symlink, or the host itself does not have the permission. Both are the fence working.
 
-**The daemon says another copy of itself is already registered.** Two daemons share one identity when
-they use the same config directory. Stop the other one, or point this one somewhere else with
-`RIOZELINK_CONFIG_DIR`.
+**Two daemons are running.** Nothing stops a second copy that shares a config directory. The two share
+one identity, so they join the same rooms, and a browser offering into one may get an answer from
+either. Stop the other copy, or point this one somewhere else with `RIOZELINK_CONFIG_DIR`.
 
 ## Development
 
@@ -437,8 +439,8 @@ bun test        # the end to end suite
 bun run check   # types
 ```
 
-The tests are the reference client. They start a real PeerServer and a real daemon on free ports
-with a temporary config directory, connect real WebRTC peers, pair with the actual words, and then
-exercise the registrations, filesystem, path refusals, symlink escapes, Anki forwarding against a
-local fake, and AI streaming against a fake Ollama that answers one word per chunk. If the daemon
-satisfies that suite, it satisfies the browser, because both only ever meet at `src/protocol.ts`.
+The tests are the reference client. They start a real relay and a real daemon on free ports with a
+temporary config directory, connect real WebRTC peers, pair with the actual code, and then exercise
+the rooms, the filesystem, path refusals, symlink escapes, Anki forwarding against a local fake, and
+AI streaming against a fake Ollama that answers one word per chunk. If the daemon satisfies that
+suite, it satisfies the browser, because both only ever meet at `src/protocol.ts`.

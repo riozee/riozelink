@@ -1,15 +1,14 @@
 /**
  * The daemon itself.
  *
- * One identity, one config file, one signaling server, one set of shared folders. The host dials
- * *out*: it registers one peer id for the pairing code and one for every browser it has paired
- * with, so nothing here ever asks the user for an address, a port, or a network that happens to be
- * local.
+ * One identity, one config file, one relay, one set of shared folders. The host dials *out*: it
+ * joins one room for the pairing code and one for every browser it has paired with, so nothing here
+ * ever asks the user for an address, a port, or a network that happens to be local.
  *
  * A pairing code is minted, never standing. One is made at startup and one whenever the user asks
  * for another, it lives for three minutes, and nothing renews it. When it expires or a browser uses
- * it, the room it named comes down and the daemon is left registered only under the ids it shares
- * with browsers it already knows. That quiet default is the point: the one id in this design whose
+ * it, the room it named is left and the daemon is left sitting only in the rooms it shares with
+ * browsers it already knows. That quiet default is the point: the one room in this design whose
  * secret is small enough to attack is the one that exists only while somebody is being let in.
  *
  * The code is the only secret that ever appears in a terminal. Returning clients meet the host
@@ -33,14 +32,14 @@ import { HostError } from './errors.ts';
 import { loadOrCreateIdentity, type HostIdentity } from './identity.ts';
 import { createPeerLink, type PeerLink } from './peer.ts';
 import {
-	isOfferPayload,
-	linkId,
-	pairId,
+	linkRoom,
+	pairRoom,
 	pairProof,
 	PROTOCOL_VERSION,
+	SIGNAL_URL,
 	type AnkiStatusReply,
+	type RelayMessage,
 	type RpcSubsystem,
-	type SignalPayload,
 	type StatusInfoReply
 } from './protocol.ts';
 import { SignalLink } from './signal.ts';
@@ -68,7 +67,10 @@ export interface LogEntry {
 export interface RiozeLinkHostOptions {
 	/** Moves `config.json` and `identity.json` somewhere else. The tests use it. */
 	configDir?: string;
-	/** Overrides the signaling server URL in the config file. */
+	/**
+	 * Overrides the relay host. The tests use it. Nothing else can: the meeting point is one fixed
+	 * machine, and it is deliberately not a setting a user is offered.
+	 */
 	signal?: string;
 	/** Overrides how long a minted code is good for. The tests use it. */
 	pairingTtlMs?: number;
@@ -78,10 +80,10 @@ export interface RiozeLinkHostOptions {
 	onUpdate?(): void;
 }
 
-/** One registration with the signaling server, plus whatever came out of it. */
+/** One room on the relay, plus whatever came out of it. */
 interface HostLink {
-	/** The peer id this link holds. */
-	id: string;
+	/** The room this link sits in. */
+	room: string;
 	kind: 'pair' | 'link';
 	/** The client label for a client link, `pairing` for the code one. */
 	label: string;
@@ -108,7 +110,7 @@ export class RiozeLinkHost implements SessionHost {
 	private readonly watcher: ShareWatcher;
 	private readonly logs: LogEntry[] = [];
 	private readonly listeners = new Set<() => void>();
-	private signalBase: string;
+	private relay: string;
 	/** The live code, or null when nothing is listening for one. */
 	private pairingPhrase: string | null = generatePhrase();
 	private pairingCreatedAt = Date.now();
@@ -135,8 +137,7 @@ export class RiozeLinkHost implements SessionHost {
 		if (this.hostName !== config.hostName) {
 			this.config.hostName = this.hostName;
 		}
-		this.signalBase = options.signal?.trim() || config.signal;
-		if (this.signalBase !== config.signal) this.config.signal = this.signalBase;
+		this.relay = options.signal?.trim() || SIGNAL_URL;
 		const hostServices = {
 			config: this.config,
 			save: () => this.save(),
@@ -172,7 +173,6 @@ export class RiozeLinkHost implements SessionHost {
 			}
 		});
 		this.log('info', `RiozeLink ${this.hostVersion} ready for ${this.hostName}`);
-		this.log('info', `meeting point: ${this.signalBase}`);
 		this.notify();
 	}
 
@@ -192,104 +192,98 @@ export class RiozeLinkHost implements SessionHost {
 	/* -------------------------------------------------------------------- links ------- */
 
 	/**
-	 * Makes the registrations on the signaling server match the ones this host should be holding: a
-	 * pairing room while a code is live, plus one quiet id per paired client. Called at boot,
-	 * whenever a code is minted or retired, and whenever the client list changes.
+	 * Makes the rooms this host is sitting in match the ones it should be: a pairing room while a
+	 * code is live, plus one quiet room per paired client. Called at boot, whenever a code is minted
+	 * or retired, and whenever the client list changes.
 	 *
-	 * The pairing room being absent from `desired` is what takes it off the server. Nothing else has
-	 * to remember to close it.
+	 * The pairing room being absent from `desired` is what closes it. Nothing else has to remember
+	 * to leave.
 	 */
 	async syncLinks(): Promise<void> {
 		const desired = new Map<string, { kind: 'pair' | 'link'; label: string }>();
 		const code = this.pairingCode();
-		if (code) desired.set(await pairId(code), { kind: 'pair', label: 'pairing' });
+		if (code) desired.set(await pairRoom(code), { kind: 'pair', label: 'pairing' });
 		for (const [fingerprint, client] of Object.entries(this.config.authorizedClients)) {
-			desired.set(await linkId(this.identity.fingerprintHex, fingerprint), {
+			desired.set(await linkRoom(this.identity.fingerprintHex, fingerprint), {
 				kind: 'link',
 				label: client.label
 			});
 		}
 
-		for (const [id, entry] of [...this.links]) {
-			const wanted = desired.get(id);
+		for (const [room, entry] of [...this.links]) {
+			const wanted = desired.get(room);
 			if (wanted?.kind === entry.kind) continue;
-			this.links.delete(id);
+			this.links.delete(room);
 			// A client link only closes when the browser behind it was revoked, so its session goes
 			// with it. The pairing link is different: retiring the code must never hang up on the
-			// browser that just paired through it, and the DataChannel does not need the signaling
-			// server anymore anyway.
+			// browser that just paired through it, and the DataChannel does not need the relay anyway.
 			if (entry.kind === 'link') {
-				entry.session?.dispose('its registration closed');
-				entry.peer?.close('its registration closed');
+				entry.session?.dispose('its room closed');
+				entry.peer?.close('its room closed');
 			}
-			entry.link.close('registration closed');
+			entry.link.close('room closed');
 		}
 
-		for (const [id, wanted] of desired) {
-			const existing = this.links.get(id);
+		for (const [room, wanted] of desired) {
+			const existing = this.links.get(room);
 			if (!existing) {
-				this.openLink(id, wanted.kind, wanted.label);
+				this.openLink(room, wanted.kind, wanted.label);
 				continue;
 			}
-			// A registration that gave up has to be rebuilt, or the id stays dark forever and the
-			// browsers that belong to it find nobody home.
+			// A socket that gave up has to be rebuilt, or the room stays empty and the browsers that
+			// belong to it find nobody home.
 			if (!existing.link.online && !existing.link.retrying) {
 				existing.link.close('reopening');
-				this.links.delete(id);
-				this.openLink(id, wanted.kind, wanted.label);
+				this.links.delete(room);
+				this.openLink(room, wanted.kind, wanted.label);
 			}
 		}
 	}
 
-	private openLink(id: string, kind: 'pair' | 'link', label: string): void {
+	private openLink(room: string, kind: 'pair' | 'link', label: string): void {
 		const entry: HostLink = {
-			id,
+			room,
 			kind,
 			label,
 			link: null as unknown as SignalLink,
 			peer: null,
 			session: null
 		};
-		this.links.set(id, entry);
+		this.links.set(room, entry);
 		entry.link = new SignalLink({
-			base: this.signalBase,
-			id,
-			onSignal: (payload, from) => void this.handleSignal(entry, payload, from),
-			onPeerLeft: (from) => this.log('info', `${from} left, or its offer expired`),
+			base: this.relay,
+			room,
+			onMessage: (message, from) => void this.handleSignal(entry, message, from),
 			onOpen: () => this.notify(),
-			onLost: (reason) => this.log('warn', `${reason} — the registration stays and retries`),
-			onTaken: () =>
-				this.log(
-					'error',
-					kind === 'link'
-						? `another daemon with this identity is already registered as ${label}`
-						: 'another daemon with this identity is already registered. Stop it and start again.'
-				),
+			onLost: (reason) => this.log('warn', `${reason}. The room stays and reconnects`),
 			log: (level, message) => this.log(level, message)
 		});
 		entry.link.connect();
 	}
 
-	private async handleSignal(entry: HostLink, data: SignalPayload, from: string): Promise<void> {
-		// A browser that lost an answer starts over with a new `connectionId`, and the peer from
-		// the lost attempt is silent on purpose (one offer is answered once). Left alone it would
-		// eat every later attempt until its own ICE gave up, which is how a link can look dead
-		// while both ends believe they are talking. A different connection id means the old peer
-		// has nothing left to say, so it goes.
-		if (
-			entry.peer &&
-			isOfferPayload(data) &&
-			entry.peer.remoteConnectionId !== undefined &&
-			data.connectionId !== entry.peer.remoteConnectionId
-		) {
-			this.log('info', `a new attempt from ${from}; letting the stalled one go`);
+	private async handleSignal(
+		entry: HostLink,
+		message: RelayMessage,
+		from: string
+	): Promise<void> {
+		if (entry.peer && entry.peer.remoteId !== undefined && from !== entry.peer.remoteId) {
+			if (message.type !== 'offer') {
+				// A room is meant to hold two ends, and the pairing one can briefly hold three. Anything
+				// from a third is somebody else's ICE, and feeding it in would corrupt this handshake.
+				this.log('warn', `ignored a ${message.type} from ${from}, which is not this link's end`);
+				return;
+			}
+			// An offer from a new sender means the older attempt is gone. Left alone, a peer that has
+			// already answered one offer would eat every later attempt until its own ICE gave up,
+			// which is how a link can look dead while both ends believe they are talking.
+			this.log('info', `a new attempt from ${from}. Letting the stalled one go`);
 			entry.peer.close('a new attempt arrived');
 			entry.peer = null;
 		}
 		if (!entry.peer) {
 			entry.peer = createPeerLink({
 				iceServers: this.options.iceServers ?? [],
-				send: (payload) => entry.link.send(payload),
+				send: (outgoing) => entry.link.send(outgoing),
 				onChannel: (channel) => this.attachChannel(entry, channel),
 				onClosed: (reason) => {
 					entry.peer = null;
@@ -302,7 +296,7 @@ export class RiozeLinkHost implements SessionHost {
 				log: (message) => this.log('info', message)
 			});
 		}
-		await entry.peer.handleSignal(data);
+		await entry.peer.handleSignal(message);
 	}
 
 	private attachChannel(entry: HostLink, channel: RTCDataChannel): void {
@@ -518,7 +512,6 @@ export class RiozeLinkHost implements SessionHost {
 			uptimeMs: Date.now() - this.startedAt,
 			connectedClients: this.readyClients(),
 			platform: `${process.platform} ${process.arch}`,
-			signal: this.signalBase,
 			shares: sharesReply(this.config.folders).shares,
 			ankiEnabled: this.config.anki.enabled,
 			ai: {
@@ -530,12 +523,8 @@ export class RiozeLinkHost implements SessionHost {
 		};
 	}
 
-	signalUrl(): string {
-		return this.signalBase;
-	}
-
-	/** How many of this host's ids are registered with the signaling server right now. */
-	anchoredLinks(): number {
+	/** How many rooms this host is sitting in right now. */
+	openRooms(): number {
 		let count = 0;
 		for (const entry of this.links.values()) if (entry.link.online) count += 1;
 		return count;

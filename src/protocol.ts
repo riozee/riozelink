@@ -421,8 +421,6 @@ export interface StatusInfoReply {
 	/** How many proven clients this daemon is holding right now. The clients themselves are private. */
 	connectedClients: number;
 	platform: string;
-	/** The signaling server the host is parked on, so the client can say where the meeting point was. */
-	signal: string;
 	shares: VfsShare[];
 	ankiEnabled: boolean;
 	ai: {
@@ -507,146 +505,108 @@ export function splitAction(action: RpcAction): { subsystem: RpcSubsystem; name:
 /* ------------------------------------------------------------------------------------------------
  * Signaling
  *
- * Before there is a DataChannel there has to be an introduction. Both ends speak the PeerServer
- * protocol, the signaling server the `peerjs` library uses: every peer dials out with an id, the
- * server remembers who is where, and OFFER, ANSWER and CANDIDATE frames are forwarded to the id
- * they are addressed to. Nothing secret rides here. An id is a hash, the DataChannel is encrypted
- * by DTLS, and every session still has to pass the auth exchange above.
+ * Before there is a DataChannel there has to be an introduction. Both ends meet in a room on a
+ * relay: one WebSocket endpoint that forwards every text frame it receives to the other clients in
+ * the same room, verbatim, and says nothing of its own. It keeps no account of who is present, so
+ * the two ends address each other by the `from` id they put on their own messages.
  *
- * The default is the public PeerServer cloud. Running your own is one command (`npx peerjs`) and a
- * different URL passed to `--signal`, because it is the same protocol. No TURN server is involved
- * anywhere; see the README for what that costs.
+ * The relay is one fixed host. It is not configurable and it is not shown anywhere, because a
+ * meeting point is only as good as the machine it runs on and there is nothing a user could usefully
+ * do with the address. Nothing secret rides here either: a room name is a derived value, every
+ * payload is DTLS-encrypted once the DataChannel is up, and a session still has to pass the auth
+ * exchange above before any request is answered.
  *
- * The payload shape below is not our invention. It is what the peerjs library puts on a data
- * connection's offer, and the public cloud inspects it: a socket that sends anything else is closed
- * on the spot. `sdp` is a whole description object, `type` says `data`, and an offer carries the
- * connection's label and serialization. Speaking the library's dialect is the price of using a
- * server we do not run, and a server we do run is happy with the same frames.
+ * The message shape is the relay's recommended convention, and its rules shape the code: text
+ * frames only, 64 KiB of UTF-8 per frame, no echo back to the sender, and no server-generated
+ * traffic of any kind. Presence is the one thing the relay cannot provide, so `hello` and `bye`
+ * exist for the ends to say it themselves.
  * ---------------------------------------------------------------------------------------------- */
 
-/** The public PeerServer cloud, reached the way the peerjs library reaches it. */
-export const DEFAULT_SIGNAL_URL = 'wss://0.peerjs.com/peerjs';
+/** The relay both ends meet on. Fixed on purpose, and deliberately not something to configure. */
+export const SIGNAL_URL = 'wss://signal.rioze.dev';
 
-/** PeerServer's default key. The cloud expects this one. */
-export const SIGNAL_KEY = 'peerjs';
+/** The relay refuses a handshake that does not offer this, with a plain 404. */
+export const SIGNAL_SUBPROTOCOL = 'usagi-una-prr-prr-yaha';
 
-/** Sent as `version`. The server only uses it to warn about mismatches. */
-export const SIGNAL_VERSION = '1.5.5';
+/** The relay's frame limit, in UTF-8 bytes. A larger frame closes the socket with 1009. */
+export const SIGNAL_MAX_FRAME = 64 * 1024;
 
-/** Everything the signaling server says, and everything we say to it. */
-export type SignalMessageType =
-	| 'OPEN'
-	| 'HEARTBEAT'
-	| 'OFFER'
-	| 'ANSWER'
-	| 'CANDIDATE'
-	| 'LEAVE'
-	| 'EXPIRE'
-	| 'ID-TAKEN'
-	| 'ERROR'
-	| 'INVALID-KEY';
-
-export interface SignalMessage {
-	type: SignalMessageType;
-	/** Who sent it. The server fills this in on everything it forwards. */
-	src?: string;
-	/** Who it is for. Both ends set this on OFFER, ANSWER, CANDIDATE and LEAVE. */
-	dst?: string;
-	payload?: SignalOffer | SignalCandidate | { msg?: string } | null;
-}
-
-/** What rides inside an OFFER or an ANSWER, in the shape the peerjs library uses. */
-export interface SignalOffer {
-	sdp: { type: 'offer' | 'answer'; sdp: string };
-	/** The connection kind. RiozeLink only ever opens data channels. */
-	type: 'data';
-	/** Filled in by the sender, to tell one attempt from the next inside one link. */
-	connectionId?: string;
-	label?: string;
-	reliable?: boolean;
-	serialization?: 'binary';
-}
-
-/** What rides inside a CANDIDATE. `candidate: null` means gathering is done. */
-export interface SignalCandidate {
-	candidate: {
-		candidate: string;
-		sdpMid?: string;
-		sdpMLineIndex?: number;
-		usernameFragment?: string | null;
-	} | null;
-	type: 'data';
-	connectionId?: string;
-}
-
-/** What the rest of the daemon cares about: descriptions and candidates, nothing else. */
-export type SignalPayload = SignalOffer | SignalCandidate;
+/** What one end says to the other. */
+export type RelayMessageType = 'hello' | 'offer' | 'answer' | 'candidate' | 'bye';
 
 /**
- * Tells a description from a candidate. The envelope's own type does the real work (`OFFER`,
- * `ANSWER`, `CANDIDATE`), and this is for the payload-only paths.
+ * One message between two ends in a room.
+ *
+ * `from` is the sender's own id rather than anything the relay assigns, and it is how the other end
+ * knows who it is talking to. `to` narrows a message to a single end, which matters when a room
+ * happens to hold more than two.
  */
-export function isOfferPayload(payload: SignalPayload): payload is SignalOffer {
-	return 'sdp' in payload;
+export interface RelayMessage {
+	type: RelayMessageType;
+	/** Echo of the room, so an end sitting in several rooms can check where a message came from. */
+	room: string;
+	/** The sender's own id, picked by the sender and checked by nobody. */
+	from: string;
+	/** Unix epoch milliseconds. */
+	ts: number;
+	/** When set, only this end should act on the message. */
+	to?: string;
+	/** `offer` and `answer`. */
+	sdp?: string;
+	/** `candidate`. A null candidate is the end-of-candidates marker. */
+	candidate?: string | null;
+	sdpMid?: string | null;
+	sdpMLineIndex?: number | null;
+	/** `hello`: the protocol revision, so two ends can notice they disagree. */
+	protocol?: number;
 }
+
+/** What an end hands to its socket: the message body, without the fields the socket fills in. */
+export type RelayOutgoing =
+	| { type: 'hello'; to?: string; protocol: number }
+	| { type: 'offer'; to?: string; sdp: string }
+	| { type: 'answer'; to?: string; sdp: string }
+	| {
+			type: 'candidate';
+			to?: string;
+			candidate: string | null;
+			sdpMid?: string | null;
+			sdpMLineIndex?: number | null;
+		}
+	| { type: 'bye'; to?: string };
 
 /**
- * An offer, with every field the library sends on a data connection. The cloud checks for them, so
- * they are filled in here rather than remembered at each call site.
+ * A throwaway id for one end of one link.
+ *
+ * The relay never checks it, so it only has to be unlikely to collide with the other end's. The
+ * prefix says which side made it, which is what a log line needs to be readable.
  */
-export function offerPayload(sdp: string, connectionId?: string): SignalOffer {
-	return {
-		sdp: { type: 'offer', sdp },
-		type: 'data',
-		connectionId,
-		label: 'rioze',
-		reliable: true,
-		serialization: 'binary'
-	};
-}
-
-/** The answer: the library sends these three fields, and the cloud accepts that. */
-export function answerPayload(sdp: string, connectionId?: string): SignalOffer {
-	return { sdp: { type: 'answer', sdp }, type: 'data', connectionId };
-}
-
-/** A gathered candidate. Gathering's end is not announced: the library never sends a null one. */
-export function candidatePayload(
-	candidate: NonNullable<SignalCandidate['candidate']>,
-	connectionId?: string
-): SignalCandidate {
-	return { candidate, type: 'data', connectionId };
-}
-
-/** A throwaway id for the browser's side of one link. Valid on any PeerServer. */
-export function makeSignalId(): string {
+export function makePeerId(prefix: 'rz-c' | 'rz-h'): string {
 	const bytes = crypto.getRandomValues(new Uint8Array(6));
 	const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
-	return `rz-c-${hex}`;
-}
-
-/** 12 hex characters, to tell one link's frames from another's inside one socket. */
-export function makeConnectionId(): string {
-	const bytes = crypto.getRandomValues(new Uint8Array(6));
-	return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+	return `${prefix}-${hex}`;
 }
 
 /**
- * The socket URL for one id.
+ * The socket URL for one room.
  *
- * `wss://0.peerjs.com/peerjs?key=peerjs&id=…&token=…&version=…` is the shape the peerjs library
- * builds, and every PeerServer, cloud or self-hosted, answers to it. A bare host gets the
- * default `/peerjs` path appended, because that is what surprises people the first time.
+ * `wss://<host>/ws?room=<room>` is the whole of it. A bare host is given the `wss://` scheme and a
+ * trailing slash is dropped, because both are things a person types.
  */
-export function signalSocketUrl(base: string, id: string, token: string): string {
-	let url = base.trim().replace(/\/+$/, '');
-	if (!/^wss?:\/\//i.test(url)) url = `wss://${url}`;
-	try {
-		if (new URL(url).pathname === '/') url = `${url}/peerjs`;
-	} catch {
-		// Not a URL at all. Let the socket fail with its own message.
-	}
-	return `${url}?key=${SIGNAL_KEY}&id=${encodeURIComponent(id)}&token=${encodeURIComponent(token)}&version=${SIGNAL_VERSION}`;
+export function signalSocketUrl(base: string, room: string): string {
+	const trimmed = base.trim().replace(/\/+$/, '');
+	const url = /^wss?:\/\//i.test(trimmed) ? trimmed : `wss://${trimmed}`;
+	return `${url}/ws?room=${encodeURIComponent(room)}`;
+}
+
+/**
+ * True when a frame fits the relay's limit.
+ *
+ * Worth asking before sending: the relay answers an oversized frame by closing the socket with 1009,
+ * which would take the whole room down over one bad message.
+ */
+export function fitsRelayFrame(text: string): boolean {
+	return new TextEncoder().encode(text).byteLength <= SIGNAL_MAX_FRAME;
 }
 
 /* ------------------------------------------------------------------------------------------------
@@ -707,8 +667,8 @@ export const ROOM_KDF_SALT = 'riozelink:room:v1';
 /**
  * The code, stretched to 256 bits.
  *
- * The room name is the one low-entropy secret this protocol publishes: the daemon registers it as a
- * peer id, which puts it in the connection string the signaling server reads. Deriving it with a
+ * The room name is the one low-entropy secret this protocol publishes: the daemon writes it into the
+ * socket URL, which is the part the relay reads. Deriving it with a
  * plain hash would let whoever reads that name test the whole code space offline at hash speed,
  * which is the difference between an afternoon and an afternoon that never ends. Stretching costs
  * the same 100,000 rounds the proof costs, once per connection, and that is affordable.
@@ -734,11 +694,11 @@ async function deriveRoomKey(phrase: string): Promise<ArrayBuffer> {
 }
 
 /**
- * The pairing id: a stretched form of the code, so the signaling server never learns the code and
- * could not walk the space if it kept a copy of this id either. Two ends can only meet here if they
- * were told the same code, and the code dies with the pairing window.
+ * The pairing room: a stretched form of the code, so the relay never learns the code and could not
+ * walk the space if it kept a copy of this name either. Two ends can only meet there if they were
+ * told the same code, and the room dies with the pairing window.
  */
-export function pairId(phrase: string): Promise<string> {
+export function pairRoom(phrase: string): Promise<string> {
 	return deriveRoomKey(phrase).then(
 		(bits) =>
 			`rz-pair-${[...new Uint8Array(bits)]
@@ -749,10 +709,10 @@ export function pairId(phrase: string): Promise<string> {
 }
 
 /**
- * The id two already-paired ends meet under, named after both fingerprints. Nobody else can compute
- * it, which is why a reconnect needs no phrase, no address, and no attention from the user.
+ * The room two already-paired ends meet in, named after both fingerprints. Nobody else can compute
+ * it, which is why a reconnect needs no code, no address, and no attention from the user.
  */
-export function linkId(hostFingerprintHex: string, clientFingerprintHex: string): Promise<string> {
+export function linkRoom(hostFingerprintHex: string, clientFingerprintHex: string): Promise<string> {
 	return sha256Hex(
 		`riozelink:link:v1:${hostFingerprintHex.toLowerCase()}:${clientFingerprintHex.toLowerCase()}`
 	).then((hex) => `rz-link-${hex.slice(0, 24)}`);

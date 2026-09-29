@@ -1,10 +1,10 @@
 /**
- * End to end: a real daemon, a real PeerServer, a real WebRTC handshake, a real config file.
+ * End to end: a real daemon, a real relay, a real WebRTC handshake, a real config file.
  *
- * Everything the client does here travels the same path the browser app will take: a signaling
- * registration, an SDP exchange through the server, a DataChannel, the auth exchange, then RPC.
- * Only the peer implementation differs (werift instead of the browser stack), which is exactly the
- * part `protocol.ts` does not care about.
+ * Everything the client does here travels the same path the browser app will take: a room join, an
+ * SDP exchange through the relay, a DataChannel, the auth exchange, then RPC. Only the peer
+ * implementation differs (werift instead of the browser stack), which is exactly the part
+ * `protocol.ts` does not care about.
  */
 import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
@@ -13,7 +13,7 @@ import path from 'node:path';
 import { loadConfig } from '../src/config.ts';
 import { RiozeLinkHost } from '../src/host.ts';
 import {
-	pairId,
+	pairRoom,
 	PROTOCOL_VERSION,
 	VFS_CHUNK,
 	WEB_CHUNK,
@@ -53,8 +53,8 @@ async function waitFor(predicate: () => boolean, what: string, timeoutMs = 8000)
 /**
  * Waits until a reading stops moving, so numbers can be compared instead of raced against.
  *
- * Registration with a signaling server happens in the background, so "how many registrations are
- * up right now" is only a fact once it has been the same answer twice.
+ * Joining a room happens in the background, so "how many rooms this host is sitting in right now"
+ * is only a fact once it has been the same answer twice.
  */
 async function settle(read: () => number, quietMs = 300, tries = 20): Promise<number> {
 	let last = read();
@@ -119,8 +119,8 @@ afterAll(async () => {
 test(
 	'one code names one meeting point, however it is typed',
 	async () => {
-		expect(await pairId('amber-cobalt-summit-drift-4g2x')).toBe(
-			await pairId('  Amber Cobalt-Summit_drift 4G2X ')
+		expect(await pairRoom('amber-cobalt-summit-drift-4g2x')).toBe(
+			await pairRoom('  Amber Cobalt-Summit_drift 4G2X ')
 		);
 
 		const phrase = liveCode();
@@ -136,16 +136,19 @@ test(
 		// same room. Capitals and spaces are presentation, never part of the secret.
 		expect(displayPhrase(phrase)).not.toContain('-');
 		expect(displayPhrase(phrase)).toBe(displayPhrase(phrase).toUpperCase());
-		expect(await pairId(displayPhrase(phrase))).toBe(await pairId(phrase));
+		expect(await pairRoom(displayPhrase(phrase))).toBe(await pairRoom(phrase));
 
 		// The room name must not be a plain hash of the code. That would hand anyone who reads it
-		// off the signaling server the whole code space at hash speed.
-		expect(await pairId(phrase)).not.toBe(
-			`rz-pair-${sha256Hex(`riozelink:pair:v1:${phrase}`).slice(0, 24)}`
+		// off the relay the whole code space at hash speed.
+		expect(await pairRoom(phrase)).not.toBe(
+			`rz-pair-${sha256Hex(`riozelink:room:v1:${phrase}`).slice(0, 24)}`
 		);
 
-		await waitFor(() => host.anchoredLinks() >= 1, 'the host to reach the signaling server');
-		primary = await TestClient.connect(signalUrl, await pairId(phrase), {
+		// A pairing room is named apart from the rooms paired ends return to, and both are stretched.
+		expect((await pairRoom(phrase)).startsWith('rz-pair-')).toBe(true);
+
+		await waitFor(() => host.openRooms() >= 1, 'the host to join a room');
+		primary = await TestClient.connect(signalUrl, await pairRoom(phrase), {
 			name: 'Test Browser'
 		});
 		const hello = await primary.hello();
@@ -158,7 +161,6 @@ test(
 
 		const status = (await primary.call('status', 'info')) as StatusInfoReply;
 		expect(status.connectedClients).toBe(1);
-		expect(status.signal).toBe(signalUrl);
 		expect(status.shares.length).toBe(1);
 		const share = status.shares[0] as VfsShare;
 		expect(share.id).toBe('notes');
@@ -581,7 +583,7 @@ test(
 		// A code is spent the moment a browser pairs with it, so this pairing mints its own.
 		host.mintPairingCode();
 		const phrase = liveCode();
-		const second = await TestClient.connect(signalUrl, await pairId(phrase), {
+		const second = await TestClient.connect(signalUrl, await pairRoom(phrase), {
 			name: 'Second Window'
 		});
 		try {
@@ -605,7 +607,7 @@ test(
 		// The used code is retired, so the impostor needs a fresh one to fail against. It can find the
 		// room, and that is as far as it gets.
 		host.mintPairingCode();
-		const impostor = await TestClient.connect(signalUrl, await pairId(liveCode()), {
+		const impostor = await TestClient.connect(signalUrl, await pairRoom(liveCode()), {
 			name: 'Impostor'
 		});
 		try {
@@ -633,7 +635,7 @@ test(
 		// is mid-handshake, and left alone it would ignore every offer that follows — the state a
 		// reload used to land in, where the link only came back after the daemon was restarted.
 		host.mintPairingCode();
-		const target = await pairId(liveCode());
+		const target = await pairRoom(liveCode());
 		const stalled = await offerAndStall(signalUrl, target);
 		try {
 			// Give the host time to build that peer and answer the offer that goes nowhere.
@@ -670,11 +672,11 @@ test(
 			expect(short.pairingCode()).not.toBeNull();
 			expect(short.pairingRemainingMs()).toBeLessThanOrEqual(600);
 			// One registration, the pairing room, and nothing else this daemon holds.
-			await waitFor(() => short.anchoredLinks() === 1, 'the pairing room to open');
+			await waitFor(() => short.openRooms() === 1, 'the pairing room to open');
 
 			await waitFor(() => short.pairingCode() === null, 'the code to expire on its own', 5000);
 			expect(short.pairingRemainingMs()).toBe(0);
-			await waitFor(() => short.anchoredLinks() === 0, 'the room to come down with it');
+			await waitFor(() => short.openRooms() === 0, 'the room to come down with it');
 
 			// And it stays expired. Nothing mints a replacement while nobody is asking.
 			await new Promise((resolve) => setTimeout(resolve, 300));
@@ -702,13 +704,13 @@ test(
 		expect(host.pairingRemainingMs()).toBeLessThanOrEqual(3 * 60_000);
 
 		// The room is the only thing a stranger can even find, and minting is what opens it.
-		const withRoom = await settle(() => host.anchoredLinks());
+		const withRoom = await settle(() => host.openRooms());
 		expect(withRoom).toBeGreaterThan(0);
 
 		host.retirePairingCode('the test was done with it');
 		expect(host.pairingCode()).toBeNull();
 		expect(host.pairingRemainingMs()).toBe(0);
-		const withoutRoom = await settle(() => host.anchoredLinks());
+		const withoutRoom = await settle(() => host.openRooms());
 		expect(withoutRoom).toBe(withRoom - 1);
 
 		// Nothing renews one on its own, however long the daemon sits there.
