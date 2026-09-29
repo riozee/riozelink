@@ -456,6 +456,39 @@ test(
 
 			const dead = await primary.expectFailure('web', 'fetch', { url: 'http://127.0.0.1:1/' });
 			expect(dead.code).toBe('offline');
+
+			// The proxy is the host's switch, not the browser's: turning it off refuses every
+			// web action, and the answer is what a client that connects later reads too.
+			const off = (await primary.call('web', 'set-enabled', { enabled: false })) as {
+				enabled: boolean;
+			};
+			expect(off.enabled).toBe(false);
+			expect(((await primary.call('status', 'info', {})) as { webEnabled: boolean }).webEnabled).toBe(
+				false
+			);
+			const refusedFetch = await primary.expectFailure('web', 'fetch', { url: `${origin}/` });
+			expect(refusedFetch.code).toBe('denied');
+			const refusedProbe = await primary.expectFailure('web', 'probe', { url: `${origin}/` });
+			expect(refusedProbe.code).toBe('denied');
+			const refusedRead = await primary.expectFailure('web', 'read', {
+				id: meta.id,
+				offset: 0,
+				length: 10
+			});
+			expect(refusedRead.code).toBe('denied');
+			// Turning it back on is the one action that has to keep working while it is off.
+			const on = (await primary.call('web', 'set-enabled', { enabled: true })) as {
+				enabled: boolean;
+			};
+			expect(on.enabled).toBe(true);
+			expect(((await primary.call('status', 'info', {})) as { webEnabled: boolean }).webEnabled).toBe(
+				true
+			);
+			// And the config is a real file, so the switch survives a restart.
+			const saved = JSON.parse(
+				await readFile(path.join(root, 'config', 'config.json'), 'utf8')
+			) as { web?: { enabled?: boolean } };
+			expect(saved.web?.enabled).toBe(true);
 		} finally {
 			site.stop(true);
 		}

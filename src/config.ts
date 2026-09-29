@@ -34,6 +34,14 @@ export interface AiConfig {
 	apiKey: string;
 }
 
+export interface WebConfig {
+	/**
+	 * The user's toggle. Off means every `web:` action but the toggle itself is refused, since
+	 * the fetch spends this machine's network and leaves this machine's address in the answer.
+	 */
+	enabled: boolean;
+}
+
 export interface AuthorizedClient {
 	label: string;
 	/** Epoch ms. */
@@ -46,6 +54,7 @@ export interface HostConfig {
 	folders: Record<string, ShareRecord>;
 	anki: AnkiConfig;
 	ai: AiConfig;
+	web: WebConfig;
 	authorizedClients: Record<string, AuthorizedClient>;
 }
 
@@ -86,6 +95,7 @@ export function defaultConfig(): HostConfig {
 			model: DEFAULT_MODELS.ollama,
 			apiKey: ''
 		},
+		web: { enabled: true },
 		authorizedClients: {}
 	};
 }
@@ -133,6 +143,10 @@ export function normalizeConfig(raw: unknown): HostConfig {
 		if (typeof raw.ai.model === 'string' && raw.ai.model.trim())
 			config.ai.model = raw.ai.model.trim();
 		if (typeof raw.ai.apiKey === 'string') config.ai.apiKey = raw.ai.apiKey;
+	}
+
+	if (isRecord(raw.web)) {
+		if (typeof raw.web.enabled === 'boolean') config.web.enabled = raw.web.enabled;
 	}
 
 	if (isRecord(raw.authorizedClients)) {

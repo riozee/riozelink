@@ -308,6 +308,23 @@ export interface WebProbeReply {
 	status: number;
 }
 
+/**
+ * The web proxy toggle.
+ *
+ * It is the host's decision rather than the browser's, for the same reason the Anki and AI
+ * switches are: the fetch spends this machine's network and leaves this machine's address in
+ * somebody else's log. A flag held by one browser could not stop the next one from asking, so
+ * the only place a refusal can be enforced is here, in front of `web:fetch`.
+ */
+export interface WebSetEnabledRequest {
+	enabled: boolean;
+}
+
+export interface WebStatusReply {
+	/** The user's toggle. Off means every `web:` action except this one is refused. */
+	enabled: boolean;
+}
+
 /** An external change the host noticed in a shared folder. */
 export interface VfsChangedEvent {
 	shareId: string;
@@ -424,6 +441,8 @@ export interface StatusInfoReply {
 	platform: string;
 	shares: VfsShare[];
 	ankiEnabled: boolean;
+	/** Whether this machine will fetch pages for the browser. See `WebSetEnabledRequest`. */
+	webEnabled: boolean;
 	ai: {
 		enabled: boolean;
 		provider: AiProvider;
@@ -464,6 +483,7 @@ export interface RpcSpec {
 	'web:fetch': { payload: WebFetchRequest; reply: WebFetchReply };
 	'web:read': { payload: WebReadRequest; reply: WebReadReply };
 	'web:probe': { payload: WebProbeRequest; reply: WebProbeReply };
+	'web:set-enabled': { payload: WebSetEnabledRequest; reply: WebStatusReply };
 
 	'anki:status': { payload: Record<string, never>; reply: AnkiStatusReply };
 	'anki:set-enabled': { payload: AnkiSetEnabledRequest; reply: AnkiStatusReply };

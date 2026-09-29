@@ -291,7 +291,10 @@ export class RiozeLinkHost implements SessionHost {
 						entry.session.dispose(`the link ended (${reason})`);
 					}
 					entry.session = null;
-					this.log('info', `the ${entry.kind} link with ${from} ended (${reason})`);
+						this.log(
+							'info',
+							`the ${entry.kind === 'pair' ? 'pairing' : 'link'} room with ${from} ended (${reason})`
+						);
 				},
 				log: (message) => this.log('info', message)
 			});
@@ -514,6 +517,7 @@ export class RiozeLinkHost implements SessionHost {
 			platform: `${process.platform} ${process.arch}`,
 			shares: sharesReply(this.config.folders).shares,
 			ankiEnabled: this.config.anki.enabled,
+			webEnabled: this.config.web.enabled,
 			ai: {
 				enabled: this.config.ai.enabled,
 				provider: this.config.ai.provider,
@@ -532,6 +536,20 @@ export class RiozeLinkHost implements SessionHost {
 
 	async save(): Promise<void> {
 		await saveConfig(this.config, this.configPath);
+	}
+
+	/**
+	 * The web proxy toggle.
+	 *
+	 * The browser asks for this and the host decides, because the fetch spends this machine's
+	 * network and this machine's address, and because the answer has to hold for a browser that
+	 * pairs tomorrow as much as for the one that is asking now. The file is the same one the
+	 * user can edit by hand, so the panel and the editor never disagree.
+	 */
+	async setWebEnabled(enabled: boolean): Promise<boolean> {
+		this.config.web.enabled = enabled === true;
+		await this.save();
+		return this.config.web.enabled;
 	}
 
 	/* ----------------------------------------------------------------------- log ------- */

@@ -58,6 +58,8 @@ export interface SessionHost {
 	removeShare(id: string): Promise<void>;
 	/** Asks the host to re-probe Anki right now, so a toggle answers with fresh truth. */
 	ankiChanged(): Promise<void>;
+	/** The web proxy toggle, persisted with the config and answered with the value that stuck. */
+	setWebEnabled(enabled: boolean): Promise<boolean>;
 	sessionClosed(session: ClientSession): void;
 	readonly ai: AiService;
 	readonly anki: AnkiService;
@@ -397,7 +399,20 @@ export class ClientSession {
 
 	private async handleWeb(action: string, raw: unknown): Promise<unknown> {
 		const payload = (raw ?? {}) as Record<string, unknown>;
+		// One gate in front of every web action, so nothing can slip past the toggle. Turning it
+		// back on is the single exception, or a host with the proxy off could never be asked.
+		if (action !== 'set-enabled' && !this.host.config.web.enabled) {
+			throw new HostError('the web proxy is turned off in riozelink', 'denied');
+		}
 		switch (action) {
+			case 'set-enabled': {
+				const enabled = await this.host.setWebEnabled(payload.enabled === true);
+				this.host.log(
+					'info',
+					`${this.clientLabel || this.clientName} turned the web proxy ${enabled ? 'on' : 'off'}`
+				);
+				return { enabled };
+			}
 			case 'fetch': {
 				const asked = requireString(payload.url, 'url');
 				let page: WebPage;

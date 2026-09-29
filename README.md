@@ -188,6 +188,14 @@ The fetch has no cookie jar. It sends no credentials the site does not hand out 
 only `http` and `https` URLs are accepted. A page fetched this way cannot sign anyone in, and the
 app says so on screen instead of implying otherwise.
 
+All of it is behind one switch, `web.enabled`, and the switch is here rather than in the browser
+on purpose. The fetch spends this machine's network and leaves this machine's address in somebody
+else's log, and a client that could turn its own fetching on would make that decision for you.
+So the daemon is the one place it can be refused: with `web.enabled` off, `web:fetch`, `web:read`
+and `web:probe` all answer `denied` and nothing leaves the machine. Flip it in **RiozeLink → Web**
+in riozeOS (the app calls `web:set-enabled`), or edit the file and restart. It defaults to on,
+because the browser is not much use without it.
+
 ## The configuration file
 
 `~/.config/riozelink/config.json`, created on first start. It is meant to be edited by hand, and
@@ -208,6 +216,7 @@ anything unreadable falls back to its default rather than breaking the daemon.
 		"model": "llama3.2",
 		"apiKey": ""
 	},
+	"web": { "enabled": true },
 	"authorizedClients": {
 		"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08": {
 			"label": "Browser",
