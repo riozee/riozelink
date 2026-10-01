@@ -35,6 +35,18 @@ export interface SignalLinkOptions {
 
 const BACKOFF_MIN_MS = 1000;
 const BACKOFF_MAX_MS = 30_000;
+/**
+ * How long a healthy room connection is kept before it is replaced.
+ *
+ * A room is a quiet place. Nothing may be said in it for hours, and a connection that idle is the
+ * one a sleeping laptop or a NAT timeout takes away silently: no FIN, no error, so `online` still
+ * reads true, the room still looks occupied, and every introduction sent into it is lost with no
+ * line in the log to say why. The far end is the only one that could notice, and the far end never
+ * speaks. Replacing the socket on a timer bounds that silence, and a DataChannel that is already
+ * open does not notice the change. A machine that slept through this timer only makes it fire
+ * late, which is exactly the moment every room needs a fresh socket.
+ */
+const REFRESH_MS = 120_000;
 
 /** What a close code means, in words a log reader can act on. */
 function closeReason(code: number): string {
@@ -59,6 +71,7 @@ export class SignalLink {
 	private joined = false;
 	private attempt = 0;
 	private retryTimer: NodeJS.Timeout | null = null;
+	private refreshTimer: NodeJS.Timeout | null = null;
 
 	constructor(private readonly options: SignalLinkOptions) {
 		this.room = options.room;
@@ -91,6 +104,7 @@ export class SignalLink {
 			// host is the answering side, so it says hello and then waits.
 			this.send({ type: 'hello', protocol: PROTOCOL_VERSION });
 			this.options.onOpen?.();
+			this.armRefresh();
 		};
 		socket.onmessage = (event) => this.handleMessage(event.data);
 		socket.onerror = () => {
@@ -101,6 +115,7 @@ export class SignalLink {
 			const wasJoined = this.joined;
 			this.socket = null;
 			this.joined = false;
+			this.clearRefresh();
 			const reason = closeReason(event.code);
 			if (wasJoined) this.options.onLost?.(reason);
 			if (!this.stopped) this.scheduleRetry(reason);
@@ -109,6 +124,7 @@ export class SignalLink {
 
 	close(reason = 'closed'): void {
 		this.stopped = true;
+		this.clearRefresh();
 		if (this.retryTimer) clearTimeout(this.retryTimer);
 		this.retryTimer = null;
 		this.dropSocket(reason);
@@ -184,5 +200,29 @@ export class SignalLink {
 			this.connect();
 		}, wait);
 		this.retryTimer.unref?.();
+	}
+
+	/**
+	 * Replaces a healthy connection before anything can quietly kill it.
+	 *
+	 * The old socket is dropped first, so its own close handler does not read as a lost room and
+	 * schedule a retry on top of this one, and the replacement joins the same room. A browser that
+	 * dials during the gap repeats its offer a moment later, which is what it already does when a
+	 * room answers nothing.
+	 */
+	private armRefresh(): void {
+		this.clearRefresh();
+		this.refreshTimer = setTimeout(() => {
+			this.refreshTimer = null;
+			if (this.stopped || this.socket === null) return;
+			this.dropSocket('a fresh room connection');
+			this.connect();
+		}, REFRESH_MS);
+		this.refreshTimer.unref?.();
+	}
+
+	private clearRefresh(): void {
+		if (this.refreshTimer) clearTimeout(this.refreshTimer);
+		this.refreshTimer = null;
 	}
 }
