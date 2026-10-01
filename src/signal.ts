@@ -12,6 +12,8 @@
 import {
 	fitsRelayFrame,
 	makePeerId,
+	PING_FRAME,
+	PONG_FRAME,
 	PROTOCOL_VERSION,
 	signalSocketUrl,
 	SIGNAL_SUBPROTOCOL,
@@ -36,17 +38,16 @@ export interface SignalLinkOptions {
 const BACKOFF_MIN_MS = 1000;
 const BACKOFF_MAX_MS = 30_000;
 /**
- * How long a healthy room connection is kept before it is replaced.
- *
- * A room is a quiet place. Nothing may be said in it for hours, and a connection that idle is the
- * one a sleeping laptop or a NAT timeout takes away silently: no FIN, no error, so `online` still
- * reads true, the room still looks occupied, and every introduction sent into it is lost with no
- * line in the log to say why. The far end is the only one that could notice, and the far end never
- * speaks. Replacing the socket on a timer bounds that silence, and a DataChannel that is already
- * open does not notice the change. A machine that slept through this timer only makes it fire
- * late, which is exactly the moment every room needs a fresh socket.
+ * The heartbeat is the only way this end can tell a quiet room from a lost line. A room says
+ * nothing for hours, so a line killed by a sleeping machine or a router's idle timeout looks
+ * perfectly connected: no FIN, no error, and every message sent into it is simply lost. The relay
+ * answers the probe at its own edge, which is what makes asking this often affordable. Asleep or
+ * awake, the answer that never comes is the one honest signal there is.
  */
-const REFRESH_MS = 120_000;
+/** How often the line is asked whether it is still there. */
+const PING_INTERVAL_MS = 15_000;
+/** How long an answer is given before the line is taken for lost. */
+const PONG_TIMEOUT_MS = 5_000;
 
 /** What a close code means, in words a log reader can act on. */
 function closeReason(code: number): string {
@@ -71,7 +72,9 @@ export class SignalLink {
 	private joined = false;
 	private attempt = 0;
 	private retryTimer: NodeJS.Timeout | null = null;
-	private refreshTimer: NodeJS.Timeout | null = null;
+	private pingTimer: NodeJS.Timeout | null = null;
+	/** The deadline for the answer to the ping that is outstanding, while one is. */
+	private pongDeadline: NodeJS.Timeout | null = null;
 
 	constructor(private readonly options: SignalLinkOptions) {
 		this.room = options.room;
@@ -104,7 +107,7 @@ export class SignalLink {
 			// host is the answering side, so it says hello and then waits.
 			this.send({ type: 'hello', protocol: PROTOCOL_VERSION });
 			this.options.onOpen?.();
-			this.armRefresh();
+			this.armHeartbeat();
 		};
 		socket.onmessage = (event) => this.handleMessage(event.data);
 		socket.onerror = () => {
@@ -115,7 +118,7 @@ export class SignalLink {
 			const wasJoined = this.joined;
 			this.socket = null;
 			this.joined = false;
-			this.clearRefresh();
+			this.clearHeartbeat();
 			const reason = closeReason(event.code);
 			if (wasJoined) this.options.onLost?.(reason);
 			if (!this.stopped) this.scheduleRetry(reason);
@@ -124,7 +127,7 @@ export class SignalLink {
 
 	close(reason = 'closed'): void {
 		this.stopped = true;
-		this.clearRefresh();
+		this.clearHeartbeat();
 		if (this.retryTimer) clearTimeout(this.retryTimer);
 		this.retryTimer = null;
 		this.dropSocket(reason);
@@ -133,6 +136,20 @@ export class SignalLink {
 	/** Sends one message to the room. The socket fills in the room, the sender and the clock. */
 	send(message: RelayOutgoing): void {
 		this.sendRaw({ ...message, room: this.room, from: this.id, ts: Date.now() });
+	}
+
+	/**
+	 * One frame exactly as written, for the heartbeat the relay matches verbatim. A room message
+	 * carries the room, the sender and the clock, and any of those would stop it being a ping.
+	 */
+	private sendExact(text: string): void {
+		const socket = this.socket;
+		if (!socket || socket.readyState !== WebSocket.OPEN) return;
+		try {
+			socket.send(text);
+		} catch (error) {
+			this.options.log('warn', `relay send failed: ${(error as Error).message}`);
+		}
 	}
 
 	/** Tells the room this end is leaving. Best effort: the socket may already be gone. */
@@ -163,6 +180,12 @@ export class SignalLink {
 	private handleMessage(data: unknown): void {
 		// The relay forwards text and drops binary, so anything else is somebody else's protocol.
 		if (typeof data !== 'string') return;
+		// The relay's own answer to this link's heartbeat. It is the one frame a room never sees, and
+		// it stops here rather than being handed up as a room message.
+		if (data === PONG_FRAME) {
+			this.clearPong();
+			return;
+		}
 		let message: RelayMessage;
 		try {
 			message = JSON.parse(data) as RelayMessage;
@@ -203,26 +226,38 @@ export class SignalLink {
 	}
 
 	/**
-	 * Replaces a healthy connection before anything can quietly kill it.
+	 * Asks the relay whether the line is still there, and takes silence for an answer.
 	 *
-	 * The old socket is dropped first, so its own close handler does not read as a lost room and
-	 * schedule a retry on top of this one, and the replacement joins the same room. A browser that
-	 * dials during the gap repeats its offer a moment later, which is what it already does when a
-	 * room answers nothing.
+	 * The probe is cheap because the edge answers it, so a lost line is found in seconds instead of
+	 * lasting until something restarts, which is the whole difference between a room that recovers
+	 * while a browser is knocking and a room that stays dark through every knock.
 	 */
-	private armRefresh(): void {
-		this.clearRefresh();
-		this.refreshTimer = setTimeout(() => {
-			this.refreshTimer = null;
-			if (this.stopped || this.socket === null) return;
-			this.dropSocket('a fresh room connection');
-			this.connect();
-		}, REFRESH_MS);
-		this.refreshTimer.unref?.();
+	private armHeartbeat(): void {
+		this.clearHeartbeat();
+		this.pingTimer = setInterval(() => {
+			if (this.stopped || this.socket === null || this.pongDeadline) return;
+			this.sendExact(PING_FRAME);
+			this.pongDeadline = setTimeout(() => {
+				this.pongDeadline = null;
+				// A line that answers nothing is one this end cannot use, and no close frame is coming
+				// to say so. The socket is dropped first so its own close handler does not read as a lost
+				// room and schedule a second retry on top of this one.
+				this.dropSocket('the relay stopped answering');
+				this.scheduleRetry('the relay stopped answering');
+			}, PONG_TIMEOUT_MS);
+			this.pongDeadline.unref?.();
+		}, PING_INTERVAL_MS);
+		this.pingTimer.unref?.();
 	}
 
-	private clearRefresh(): void {
-		if (this.refreshTimer) clearTimeout(this.refreshTimer);
-		this.refreshTimer = null;
+	private clearPong(): void {
+		if (this.pongDeadline) clearTimeout(this.pongDeadline);
+		this.pongDeadline = null;
+	}
+
+	private clearHeartbeat(): void {
+		if (this.pingTimer) clearInterval(this.pingTimer);
+		this.pingTimer = null;
+		this.clearPong();
 	}
 }

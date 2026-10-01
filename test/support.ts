@@ -13,6 +13,8 @@ import {
 	linkRoom,
 	makePeerId,
 	pairProof,
+	PING_FRAME,
+	PONG_FRAME,
 	PROTOCOL_VERSION,
 	SIGNAL_MAX_FRAME,
 	SIGNAL_SUBPROTOCOL,
@@ -82,6 +84,12 @@ export async function startTestSignal(): Promise<{ url: string; close(): Promise
 				if (typeof payload !== 'string') return;
 				if (Buffer.byteLength(payload, 'utf8') > SIGNAL_MAX_FRAME) {
 					socket.close(1009, 'message exceeds the 64 KiB relay limit');
+					return;
+				}
+				// The heartbeat is answered here, before the room sees anything, exactly as the real edge
+				// answers it: the sender gets a pong and no peer ever hears about the ping.
+				if (payload === PING_FRAME) {
+					socket.send(PONG_FRAME);
 					return;
 				}
 				const members = rooms.get(socket.data.room);

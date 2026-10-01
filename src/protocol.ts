@@ -538,9 +538,9 @@ export function splitAction(action: RpcAction): { subsystem: RpcSubsystem; name:
  * exchange above before any request is answered.
  *
  * The message shape is the relay's recommended convention, and its rules shape the code: text
- * frames only, 64 KiB of UTF-8 per frame, no echo back to the sender, and no server-generated
- * traffic of any kind. Presence is the one thing the relay cannot provide, so `hello` and `bye`
- * exist for the ends to say it themselves.
+ * frames only, 64 KiB of UTF-8 per frame, no echo back to the sender, and nothing the server says
+ * on its own except the heartbeat's pong. Presence is the one thing the relay cannot provide, so
+ * `hello` and `bye` exist for the ends to say it themselves.
  * ---------------------------------------------------------------------------------------------- */
 
 /** The relay both ends meet on. Fixed on purpose, and deliberately not something to configure. */
@@ -551,6 +551,16 @@ export const SIGNAL_SUBPROTOCOL = 'usagi-una-prr-prr-yaha';
 
 /** The relay's frame limit, in UTF-8 bytes. A larger frame closes the socket with 1009. */
 export const SIGNAL_MAX_FRAME = 64 * 1024;
+
+/**
+ * The relay's heartbeat, answered at its own edge.
+ *
+ * Both frames are matched exactly and neither is relayed: a ping comes back as a pong to the socket
+ * that sent it, without waking the room, spending its CPU, or reaching a peer. That is what lets an
+ * end ask whether its line is still there for the price of nothing, in a place as quiet as a room.
+ */
+export const PING_FRAME = '{"type":"ping"}';
+export const PONG_FRAME = '{"type":"pong"}';
 
 /** What one end says to the other. */
 export type RelayMessageType = 'hello' | 'offer' | 'answer' | 'candidate' | 'bye';
