@@ -25,7 +25,6 @@ import {
 } from './identity.ts';
 import {
 	PROTOCOL_VERSION,
-	WEB_CHUNK,
 	type AiChatRequest,
 	type AuthHelloPayload,
 	type AuthOkPayload,
@@ -37,7 +36,7 @@ import {
 import { displayPath, fromBase64, randomId, randomNonce, toBase64, truncate } from './util.ts';
 import * as vfsOps from './vfs.ts';
 import type { UploadTable } from './vfs.ts';
-import { WEB_MAX_PAGES, fetchPage, probeFraming, type WebPage } from './web.ts';
+import { TunnelSession } from './tunnel.ts';
 
 export interface SessionHost {
 	readonly config: HostConfig;
@@ -58,8 +57,8 @@ export interface SessionHost {
 	removeShare(id: string): Promise<void>;
 	/** Asks the host to re-probe Anki right now, so a toggle answers with fresh truth. */
 	ankiChanged(): Promise<void>;
-	/** The web proxy toggle, persisted with the config and answered with the value that stuck. */
-	setWebEnabled(enabled: boolean): Promise<boolean>;
+	/** The browsing tunnel toggle. The harder switch: while it is off, no tunnel request moves. */
+	setTunnelEnabled(enabled: boolean): Promise<boolean>;
 	sessionClosed(session: ClientSession): void;
 	readonly ai: AiService;
 	readonly anki: AnkiService;
@@ -93,6 +92,8 @@ export class ClientSession {
 	private authFailures = 0;
 	private readonly uploads: UploadTable = new Map();
 	private readonly aiStreams = new Set<string>();
+	/** The browsing tunnel: one native fetch per stream, nothing remembered between them. */
+	private readonly tunnel: TunnelSession;
 	private readonly helloDeadline: NodeJS.Timeout;
 	private authDeadline: NodeJS.Timeout | null = null;
 
@@ -111,6 +112,10 @@ export class ClientSession {
 		this.helloDeadline = setTimeout(() => {
 			if (this.phase === 'awaiting-hello') this.dispose('no hello arrived');
 		}, HELLO_TIMEOUT_MS);
+		this.tunnel = new TunnelSession({
+			emit: (action, payload) => this.emit('tunnel', action, payload),
+			log: (level, message) => this.host.log(level, message)
+		});
 	}
 
 	/* ------------------------------------------------------------------ transport ------ */
@@ -148,6 +153,8 @@ export class ClientSession {
 		void vfsOps.cancelUploads(this.uploads);
 		for (const streamId of this.aiStreams) this.host.ai.cancel(streamId);
 		this.aiStreams.clear();
+		// Every tunnel stream this session was carrying stops with it; the fetches are aborted.
+		this.tunnel.dispose();
 		try {
 			this.channel.close();
 		} catch {
@@ -200,8 +207,8 @@ export class ClientSession {
 		switch (subsystem) {
 			case 'vfs':
 				return this.handleVfs(action, payload);
-			case 'web':
-				return this.handleWeb(action, payload);
+			case 'tunnel':
+				return this.handleTunnel(action, payload);
 			case 'anki':
 				return this.handleAnki(action, payload);
 			case 'ai':
@@ -388,86 +395,37 @@ export class ClientSession {
 				throw new HostError(`unknown vfs action: ${action}`, 'unsupported');
 		}
 	}
-	/* ---------------------------------------------------------------------- web -------- */
+
+	/* -------------------------------------------------------------------- tunnel ------- */
 
 	/**
-	 * The pages this session has fetched, newest last. Only four are kept, because a page is
-	 * a few hundred kilobytes and the app only ever reads back the one it just asked for.
+	 * The browsing tunnel. `set-enabled` is the one action answered while the switch is off, or a
+	 * host with the tunnel off could never be asked to turn it on.
 	 */
-	private readonly pages = new Map<string, WebPage>();
-	private pageSeq = 0;
-
-	private async handleWeb(action: string, raw: unknown): Promise<unknown> {
+	private async handleTunnel(action: string, raw: unknown): Promise<unknown> {
 		const payload = (raw ?? {}) as Record<string, unknown>;
-		// One gate in front of every web action, so nothing can slip past the toggle. Turning it
-		// back on is the single exception, or a host with the proxy off could never be asked.
-		if (action !== 'set-enabled' && !this.host.config.web.enabled) {
-			throw new HostError('the web proxy is turned off in riozelink', 'denied');
+		if (action === 'set-enabled') {
+			const enabled = await this.host.setTunnelEnabled(payload.enabled === true);
+			this.host.log(
+				'info',
+				`${this.clientLabel || this.clientName} turned the browsing tunnel ${enabled ? 'on' : 'off'}`
+			);
+			return { enabled };
+		}
+		if (!this.host.config.tunnel.enabled) {
+			throw new HostError('the browsing tunnel is turned off in riozelink', 'denied');
 		}
 		switch (action) {
-			case 'set-enabled': {
-				const enabled = await this.host.setWebEnabled(payload.enabled === true);
-				this.host.log(
-					'info',
-					`${this.clientLabel || this.clientName} turned the web proxy ${enabled ? 'on' : 'off'}`
-				);
-				return { enabled };
-			}
-			case 'fetch': {
-				const asked = requireString(payload.url, 'url');
-				let page: WebPage;
-				try {
-					page = await fetchPage(asked);
-				} catch (error) {
-					this.host.log(
-						'warn',
-						`${this.clientLabel || this.clientName} could not fetch ${asked} (${(error as Error).message})`
-					);
-					throw error;
-				}
-				this.pageSeq += 1;
-				const id = `page-${this.pageSeq.toString(36)}-${Date.now().toString(36)}`;
-				this.pages.set(id, page);
-				for (const oldest of [...this.pages.keys()].slice(0, -WEB_MAX_PAGES)) {
-					this.pages.delete(oldest);
-				}
-				this.host.log(
-					'info',
-					`${this.clientLabel || this.clientName} fetched ${page.url} (${page.html.byteLength} bytes)`
-				);
-				return {
-					id,
-					url: page.url,
-					title: page.title,
-					contentType: page.contentType,
-					size: page.html.byteLength,
-					truncated: page.truncated
-				};
-			}
-			case 'read': {
-				const id = requireString(payload.id, 'id');
-				const page = this.pages.get(id);
-				if (!page) {
-					throw new HostError('that page is no longer held. Fetch it again.', 'not-found');
-				}
-				const offset = Math.max(0, Math.floor(requireNumber(payload.offset, 'offset')));
-				const wanted = Math.max(1, Math.floor(requireNumber(payload.length, 'length')));
-				const size = page.html.byteLength;
-				if (offset >= size) return { data: '', size, done: true };
-				const end = Math.min(offset + wanted, size, offset + WEB_CHUNK);
-				return {
-					data: toBase64(page.html.subarray(offset, end)),
-					size,
-					done: end >= size
-				};
-			}
-			case 'probe': {
-				// Headers only, and no log line: this runs on every load that *might* have been
-				// refused, and a note about each one would drown the log that matters.
-				return await probeFraming(requireString(payload.url, 'url'));
-			}
+			case 'open':
+				return this.tunnel.open(payload);
+			case 'body':
+				return this.tunnel.body(payload);
+			case 'ack':
+				return this.tunnel.ack(payload);
+			case 'abort':
+				return this.tunnel.abort(payload);
 			default:
-				throw new HostError(`unknown web action: ${action}`, 'unsupported');
+				throw new HostError(`unknown tunnel action: ${action}`, 'unsupported');
 		}
 	}
 	/* ---------------------------------------------------------------------- anki ------- */

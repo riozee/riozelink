@@ -166,35 +166,40 @@ The **AI** tab has a toggle of its own, off until you turn it on, and then two p
 Setting a key is a write-only affair: the app opens a dialog, sends the key, and shows
 `sk-...1234` from there on. To replace one, use **Set a new key**. To remove one, use **Clear**.
 
-### Reading the web
+### Carrying a whole session
 
-The Browser in riozeOS can ask the daemon for a page. Most of the web refuses to sit in a frame
-(`X-Frame-Options`, a `frame-ancestors` policy), and the daemon can fetch the page with this
-machine's network and hand back a document that can be shown: one document per request, the
-meta tags that caused the refusal dropped, a `<base>` tag so the page's relative URLs still
-resolve, and a small script that reports link clicks back to the app so following a link keeps
-going through the same route.
+The Browser in riozeOS cannot frame most of the web. `X-Frame-Options` and a `frame-ancestors`
+policy are refusals an embedder has no vote in, and a sandboxed frame with no storage of its own
+cannot hold a login even when a page does load. So there is one switch, `tunnel.enabled`, and it is
+a big permission: while it is on, the Browser runs a real rewriting proxy and **every request of a
+whole browsing session** comes down this link. The proxy itself never touches this machine's
+filesystem or the browser's storage; it is code served from an origin of its own, and this daemon is
+only the pipe underneath it.
 
-The document comes back in 45 KiB chunks over the data channel, the way a file does, and only
-the document — images, stylesheets and scripts keep their real addresses and load straight from
-their own origins. Nothing is written to disk and nothing is cached between sessions; four pages
-are held per session while the tab is open.
+One exchange is four small messages plus some events. `tunnel:open` names the request and is
+answered when the response headers arrive, `tunnel:body` supplies the request's bytes when there
+are any, `tunnel:ack` says the browser took delivery of bytes already sent, and `tunnel:abort`
+says the page walked away. The response streams back as `tunnel:chunk` events ending in
+`tunnel:end`, or in `tunnel:error` when something fails after the headers. Slices are the same
+45 KiB a file uses, and the flow-control window is a window rather than a limit: once 512 KiB are
+unacknowledged the fetch stops reading, so a page that stops consuming slows this machine instead
+of filling a buffer nobody is watching.
 
-There is also a cheaper call, `web:probe`, that reads a page's *headers* and says whether it
-carries framing rules. The Browser uses it to tell a page that loaded quickly apart from a page
-that was refused, since a refused frame and an empty one look identical from inside the browser.
+Three decisions are worth knowing. **No cookie jar**: cookies ride in the request headers the
+client sends and come back in `set-cookie` untouched, because the browser's proxy keeps the jar
+and a second copy here would be a second truth about who you are. **No redirect following**: a 3xx
+is handed back with its `location`, and the proxy follows the chain itself, hop by hop through this
+same tunnel, which is what keeps every destination a rewritten page like any other. **The body is
+decoded here**: this runtime decompresses on the way through, so `content-encoding` and
+`content-length` are dropped rather than passed on as a lie. Framing headers (`x-frame-options`, a
+`content-security-policy`) are stripped at both ends.
 
-The fetch has no cookie jar. It sends no credentials the site does not hand out publicly, and
-only `http` and `https` URLs are accepted. A page fetched this way cannot sign anyone in, and the
-app says so on screen instead of implying otherwise.
-
-All of it is behind one switch, `web.enabled`, and the switch is here rather than in the browser
-on purpose. The fetch spends this machine's network and leaves this machine's address in somebody
-else's log, and a client that could turn its own fetching on would make that decision for you.
-So the daemon is the one place it can be refused: with `web.enabled` off, `web:fetch`, `web:read`
-and `web:probe` all answer `denied` and nothing leaves the machine. Flip it in **RiozeLink → Web**
-in riozeOS (the app calls `web:set-enabled`), or edit the file and restart. It defaults to on,
-because the browser is not much use without it.
+It defaults to **off**, and the Browser cannot turn it on by itself: a press on its own toggle while
+this says no explains where the switch is. With it off, every `tunnel:` action but the toggle
+answers `denied`, and the moment the switch moves the daemon tells every connected browser, so an
+armed runtime is put away at once rather than at its next poll. The honest limits: WebSockets are
+not carried yet, request bodies are assembled before the fetch starts, and a site that challenges
+proxies will challenge this one too.
 
 ## The configuration file
 
@@ -216,7 +221,7 @@ anything unreadable falls back to its default rather than breaking the daemon.
 		"model": "llama3.2",
 		"apiKey": ""
 	},
-	"web": { "enabled": true },
+	"tunnel": { "enabled": false },
 	"authorizedClients": {
 		"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08": {
 			"label": "Browser",
@@ -294,6 +299,7 @@ this design that costs money to run.
 | Filesystem    | `src/vfs.ts`, `src/sandbox.ts` | Path fence, chunked reads and writes, part files, change watching.                                                           |
 | Anki          | `src/anki.ts`                  | One toggle, a five-second probe, and a POST to the loopback.                                                                 |
 | AI            | `src/ai.ts`                    | Two dialects, one streaming shape, keys stay here.                                                                           |
+| Tunnel        | `src/tunnel.ts`                | One `fetch` per exchange, the response sliced back to the browser, no cookie jar and no redirect following.                                |
 | Wire contract | `src/protocol.ts`              | The one file both sides build their clients and their dispatchers from. Peer ids and the pairing proof are derived here too. |
 
 The riozeOS side lives in the riozeOS repository as the `com.riozelink.svelte` app. Its remote
@@ -399,6 +405,10 @@ What is worth knowing:
 
 - An authorized client can add new folders to share and turn Anki on. That is the feature, but it
   is also reach. Revoke a client with `riozelink clients revoke <name>` and restart the daemon.
+- Turning the browsing tunnel on spends this machine's network for a whole session, not one page,
+  and every byte of it passes through the daemon. What the daemon still does not keep is a cookie
+  jar, a redirect chain, or a response the browser stopped reading, and what it will not do is
+  reach into the browser's storage, where the logins actually live.
 - The pairing code is a secret while it lasts, and it does not last long. Pair from a terminal you
   are looking at, and do not read the code out to anyone you would not hand a key to.
 - The relay sees that two connections met in some room. It does not see the code, the files, the

@@ -517,7 +517,7 @@ export class RiozeLinkHost implements SessionHost {
 			platform: `${process.platform} ${process.arch}`,
 			shares: sharesReply(this.config.folders).shares,
 			ankiEnabled: this.config.anki.enabled,
-			webEnabled: this.config.web.enabled,
+			tunnelEnabled: this.config.tunnel.enabled,
 			ai: {
 				enabled: this.config.ai.enabled,
 				provider: this.config.ai.provider,
@@ -539,17 +539,20 @@ export class RiozeLinkHost implements SessionHost {
 	}
 
 	/**
-	 * The web proxy toggle.
+	 * The browsing tunnel toggle.
 	 *
-	 * The browser asks for this and the host decides, because the fetch spends this machine's
-	 * network and this machine's address, and because the answer has to hold for a browser that
-	 * pairs tomorrow as much as for the one that is asking now. The file is the same one the
-	 * user can edit by hand, so the panel and the editor never disagree.
+	 * It is the biggest permission this daemon hands out, so the host decides rather than the
+	 * browser, and the answer is written to the same file the user can edit by hand. Unlike the
+	 * other switches this one is broadcast the moment it moves: turning it off has to disarm a
+	 * proxy that is already running, so every connected browser hears the new answer instead of
+	 * discovering it at its next poll.
 	 */
-	async setWebEnabled(enabled: boolean): Promise<boolean> {
-		this.config.web.enabled = enabled === true;
+	async setTunnelEnabled(enabled: boolean): Promise<boolean> {
+		this.config.tunnel.enabled = enabled === true;
 		await this.save();
-		return this.config.web.enabled;
+		this.broadcastEvent('tunnel', 'status', { enabled: this.config.tunnel.enabled });
+		this.notify();
+		return this.config.tunnel.enabled;
 	}
 
 	/* ----------------------------------------------------------------------- log ------- */

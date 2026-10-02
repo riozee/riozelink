@@ -34,10 +34,12 @@ export interface AiConfig {
 	apiKey: string;
 }
 
-export interface WebConfig {
+
+export interface TunnelConfig {
 	/**
-	 * The user's toggle. Off means every `web:` action but the toggle itself is refused, since
-	 * the fetch spends this machine's network and leaves this machine's address in the answer.
+	 * The user's toggle for the browsing tunnel. Defaults to off, and it is the harder switch of
+	 * the two: while it is off the browser cannot enable its own side at all, because a whole
+	 * browsing session spends far more of this machine's network than one fetched page does.
 	 */
 	enabled: boolean;
 }
@@ -54,7 +56,7 @@ export interface HostConfig {
 	folders: Record<string, ShareRecord>;
 	anki: AnkiConfig;
 	ai: AiConfig;
-	web: WebConfig;
+	tunnel: TunnelConfig;
 	authorizedClients: Record<string, AuthorizedClient>;
 }
 
@@ -95,7 +97,7 @@ export function defaultConfig(): HostConfig {
 			model: DEFAULT_MODELS.ollama,
 			apiKey: ''
 		},
-		web: { enabled: true },
+		tunnel: { enabled: false },
 		authorizedClients: {}
 	};
 }
@@ -145,8 +147,8 @@ export function normalizeConfig(raw: unknown): HostConfig {
 		if (typeof raw.ai.apiKey === 'string') config.ai.apiKey = raw.ai.apiKey;
 	}
 
-	if (isRecord(raw.web)) {
-		if (typeof raw.web.enabled === 'boolean') config.web.enabled = raw.web.enabled;
+	if (isRecord(raw.tunnel)) {
+		if (typeof raw.tunnel.enabled === 'boolean') config.tunnel.enabled = raw.tunnel.enabled;
 	}
 
 	if (isRecord(raw.authorizedClients)) {

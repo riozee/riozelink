@@ -81,7 +81,10 @@ describe.skipIf(!mirror)('the app mirror agrees with the daemon', () => {
 		expect(mirror.PAIR_KDF_SALT).toBe(Daemon.PAIR_KDF_SALT);
 		expect(mirror.ROOM_KDF_SALT).toBe(Daemon.ROOM_KDF_SALT);
 		expect(mirror.VFS_CHUNK).toBe(Daemon.VFS_CHUNK);
-		expect(mirror.WEB_CHUNK).toBe(Daemon.WEB_CHUNK);
+		expect(mirror.TUNNEL_CHUNK).toBe(Daemon.TUNNEL_CHUNK);
+		expect(mirror.TUNNEL_MAX_BODY).toBe(Daemon.TUNNEL_MAX_BODY);
+		expect(mirror.TUNNEL_MAX_STREAMS).toBe(Daemon.TUNNEL_MAX_STREAMS);
+		expect(mirror.TUNNEL_WINDOW).toBe(Daemon.TUNNEL_WINDOW);
 		expect(mirror.SIGNAL_URL).toBe(Daemon.SIGNAL_URL);
 		expect(mirror.SIGNAL_SUBPROTOCOL).toBe(Daemon.SIGNAL_SUBPROTOCOL);
 		expect(mirror.SIGNAL_MAX_FRAME).toBe(Daemon.SIGNAL_MAX_FRAME);

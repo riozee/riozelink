@@ -18,7 +18,7 @@ import { isPhraseShaped, normalizePhrase } from './words.ts';
 export const PROTOCOL_VERSION = 1;
 
 /** Who a message is for. `auth` runs first; everything else answers once a session is proven. */
-export type RpcSubsystem = 'auth' | 'vfs' | 'web' | 'anki' | 'ai' | 'status';
+export type RpcSubsystem = 'auth' | 'vfs' | 'tunnel' | 'anki' | 'ai' | 'status';
 
 /**
  * The envelope of a request. A reply carries the same `id` and an `ok` flag. See {@link RpcWire}
@@ -68,15 +68,6 @@ export type RpcWire =
  * advertise, Safari among them. Chunks that fit everywhere beat chunks that are fast on paper.
  */
 export const VFS_CHUNK = 45 * 1024;
-
-/**
- * How much of one page travels per message.
- *
- * The same 45 KiB as a file chunk, and for the same reason: a fetched page rides the same
- * DataChannel and has to fit the same 64 KiB message some stacks advertise. A page is read
- * in chunks exactly like a file is.
- */
-export const WEB_CHUNK = VFS_CHUNK;
 
 /* ------------------------------------------------------------------------------------------------
  * auth
@@ -250,80 +241,122 @@ export interface VfsShareRemoveRequest {
 }
 
 /* ------------------------------------------------------------------------------------------------
- * web
+ * tunnel
  *
- * A page the host fetched. The browser cannot frame most of the web, so the host asks for the page
- * with its own IP and its own request, tidies it into something that can be framed, and hands it
- * back. The body is read in chunks the way a file is, and each page lives in the session that asked
- * for it until four more are fetched.
+ * A whole browsing session, carried over the link.
+ *
+ * The service worker that rewrites pages for the browser cannot open a WebRTC connection — a
+ * service worker has no `RTCPeerConnection` — so the requests it handles are handed to the page
+ * and travel here instead. One exchange is four small messages plus some events:
+ *
+ *   open   names the request (method, URL, headers, how many body bytes to expect) and is
+ *          answered when the response headers arrive;
+ *   body   supplies the request's bytes, in ordered slices, when there are any;
+ *   ack    is the client saying it has taken delivery of bytes already sent, which is what opens
+ *          the flow-control window back up;
+ *   abort  says the page walked away mid-flight.
+ *
+ * The response streams back as `chunk` events sliced to fit one DataChannel message, ending with
+ * `end` — or with `error`, the only way a failure that happens after the headers can be
+ * reported.
+ *
+ * Two things this subsystem deliberately is not: a cookie jar (cookies ride in the request
+ * headers and come back in `set-cookie`; the client's proxy keeps them) and a redirect follower
+ * (a 3xx is handed back with its `location`, and the client's proxy follows the chain itself,
+ * through this same tunnel). `tunnel.ts` on the host says why.
  * ---------------------------------------------------------------------------------------------- */
 
-export interface WebFetchRequest {
+export interface TunnelSetEnabledRequest {
+	enabled: boolean;
+}
+
+export interface TunnelStatusReply {
+	/** The user's toggle. Off means every tunnel action but the toggle itself is refused. */
+	enabled: boolean;
+}
+
+/** Pushed to every ready session when the toggle moved, so a browser hears it without asking. */
+export interface TunnelStatusEvent {
+	enabled: boolean;
+}
+
+export interface TunnelOpenRequest {
+	/** Chosen by the client and echoed on every message of this exchange. */
+	requestId: string;
+	method: string;
 	/** A full `http:` or `https:` URL. Anything else is refused. */
 	url: string;
+	/** Ordinary request headers. They are forwarded as sent, `set-cookie` aside. */
+	headers: Record<string, string | string[]>;
+	/** Raw bytes the request body will supply across `body` messages. `0` for none. */
+	bodyLength: number;
 }
 
-export interface WebFetchReply {
-	/** Handle for this page inside this session. Read the body with `web:read`. */
-	id: string;
-	/** Where the fetch actually ended, after redirects. */
-	url: string;
-	/** The page's own title, when it has one. */
-	title: string | null;
-	contentType: string;
-	/** Whole body size, in bytes. */
-	size: number;
-	/** True when the page was cut off at the host's limit. */
-	truncated: boolean;
+/** The response as it arrives: status and headers first, the body on `chunk` events after. */
+export interface TunnelHeadReply {
+	status: number;
+	statusText: string;
+	headers: Record<string, string | string[]>;
 }
 
-export interface WebReadRequest {
-	id: string;
-	offset: number;
-	length: number;
-}
-
-export interface WebReadReply {
-	/** Base64 of this slice of the page. */
+export interface TunnelBodyRequest {
+	requestId: string;
+	/** Base64 of this slice, raw bytes. */
 	data: string;
-	size: number;
-	/** True when this slice reaches the end. */
+	/** True on the final slice. The host fetches once the whole body has arrived. */
 	done: boolean;
 }
 
+export interface TunnelAckRequest {
+	requestId: string;
+	/** Raw bytes delivered to the page since the last acknowledgement. */
+	bytes: number;
+}
+
+export interface TunnelAbortRequest {
+	requestId: string;
+}
+
+export interface TunnelChunkEvent {
+	requestId: string;
+	/** Ordering is already guaranteed by the channel; the sequence is for the client's own ledger. */
+	seq: number;
+	/** Base64 of this slice, raw bytes. */
+	data: string;
+}
+
+export interface TunnelEndEvent {
+	requestId: string;
+}
+
+export interface TunnelErrorEvent {
+	requestId: string;
+	error: RpcErrorInfo;
+}
+
 /**
- * Asks the host to look at a page's *headers* only, without carrying the page back. The browser
- * uses it to tell a page that loaded quickly apart from a page that was refused: a site that
- * sends `X-Frame-Options` or a `frame-ancestors` policy is the one case the proxy exists for.
+ * One response slice, in raw bytes per message. The same 45 KiB as a file chunk, and for the
+ * same reason: base64 grows it by a third and the JSON envelope adds a little more, and the
+ * result has to stay under the 64 KiB message size some WebRTC stacks advertise.
  */
-export interface WebProbeRequest {
-	url: string;
-}
+export const TUNNEL_CHUNK = VFS_CHUNK;
 
-export interface WebProbeReply {
-	/** The header that would keep this page out of a frame, or null when nothing would. */
-	framing: 'x-frame-options' | 'frame-ancestors' | null;
-	/** The header's own value, for a log line the user can read. */
-	detail: string | null;
-	status: number;
-}
+/** The biggest request body the host will assemble (16 MiB), counted across `body` messages. */
+export const TUNNEL_MAX_BODY = 16 * 1024 * 1024;
 
 /**
- * The web proxy toggle.
- *
- * It is the host's decision rather than the browser's, for the same reason the Anki and AI
- * switches are: the fetch spends this machine's network and leaves this machine's address in
- * somebody else's log. A flag held by one browser could not stop the next one from asking, so
- * the only place a refusal can be enforced is here, in front of `web:fetch`.
+ * How many exchanges one session may have in flight. A page load opens a dozen at once and a
+ * heavy one opens more, so this is comfortably above both; past it the host answers `busy`
+ * rather than melting.
  */
-export interface WebSetEnabledRequest {
-	enabled: boolean;
-}
+export const TUNNEL_MAX_STREAMS = 32;
 
-export interface WebStatusReply {
-	/** The user's toggle. Off means every `web:` action except this one is refused. */
-	enabled: boolean;
-}
+/**
+ * The flow-control window, in raw bytes. The host stops reading the remote body once this many
+ * bytes are unacknowledged, so a page that stops consuming slows the host down instead of
+ * filling a buffer nobody is watching.
+ */
+export const TUNNEL_WINDOW = 512 * 1024;
 
 /** An external change the host noticed in a shared folder. */
 export interface VfsChangedEvent {
@@ -441,8 +474,8 @@ export interface StatusInfoReply {
 	platform: string;
 	shares: VfsShare[];
 	ankiEnabled: boolean;
-	/** Whether this machine will fetch pages for the browser. See `WebSetEnabledRequest`. */
-	webEnabled: boolean;
+	/** Whether this machine will carry a whole browsing session. See `TunnelSetEnabledRequest`. */
+	tunnelEnabled: boolean;
 	ai: {
 		enabled: boolean;
 		provider: AiProvider;
@@ -480,10 +513,11 @@ export interface RpcSpec {
 	'vfs:share-add': { payload: VfsShareAddRequest; reply: VfsShareAddReply };
 	'vfs:share-remove': { payload: VfsShareRemoveRequest; reply: Record<string, never> };
 
-	'web:fetch': { payload: WebFetchRequest; reply: WebFetchReply };
-	'web:read': { payload: WebReadRequest; reply: WebReadReply };
-	'web:probe': { payload: WebProbeRequest; reply: WebProbeReply };
-	'web:set-enabled': { payload: WebSetEnabledRequest; reply: WebStatusReply };
+	'tunnel:set-enabled': { payload: TunnelSetEnabledRequest; reply: TunnelStatusReply };
+	'tunnel:open': { payload: TunnelOpenRequest; reply: TunnelHeadReply };
+	'tunnel:body': { payload: TunnelBodyRequest; reply: Record<string, never> };
+	'tunnel:ack': { payload: TunnelAckRequest; reply: Record<string, never> };
+	'tunnel:abort': { payload: TunnelAbortRequest; reply: Record<string, never> };
 
 	'anki:status': { payload: Record<string, never>; reply: AnkiStatusReply };
 	'anki:set-enabled': { payload: AnkiSetEnabledRequest; reply: AnkiStatusReply };
@@ -508,6 +542,7 @@ export type RpcResult<A extends RpcAction> = RpcSpec[A]['reply'];
 export interface RpcEvents {
 	'vfs:changed': VfsChangedEvent;
 	'vfs:shares': VfsSharesReply;
+	'tunnel:status': TunnelStatusEvent;
 	'anki:status': AnkiStatusReply;
 	'ai:chunk': AiChunkEvent;
 	'ai:end': AiEndEvent;

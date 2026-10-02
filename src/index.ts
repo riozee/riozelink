@@ -95,9 +95,9 @@ SIGUSR2 when there is no panel to press. Once a code expires or a browser uses i
 leaves that room and sits only in the rooms it shares with browsers it already knows.
 
 Three switches live in the config file, and the RiozeLink window can flip all three. AnkiConnect
-and the AI gateway start off and stay off until you turn them on. The web proxy starts on,
-because it is what lets the browser show a page that refuses to be framed, and it is the switch
-to reach for when you would rather this machine's address did not end up in somebody's log.
+and the AI gateway start off and stay off until you turn them on. The browsing tunnel starts off
+as well, and it is the biggest permission of the three: with it on, a whole browsing session
+travels over this link and every byte of it is fetched by this machine.
 `);
 }
 
@@ -261,7 +261,7 @@ async function status(): Promise<void> {
 	process.stdout.write(
 		`ai        ${config.ai.enabled ? 'on' : 'off'} · ${config.ai.provider} · ${config.ai.model}${config.ai.apiKey ? ` · key ${maskKey(config.ai.apiKey)}` : ' · no key'}\n`
 	);
-	process.stdout.write(`web       ${config.web.enabled ? 'on' : 'off'}\n`);
+	process.stdout.write(`tunnel    ${config.tunnel.enabled ? 'on' : 'off'}\n`);
 }
 
 async function main(): Promise<void> {
