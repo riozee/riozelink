@@ -158,10 +158,16 @@ Nothing about your collection is stored anywhere. The calls are proxied and forg
 The **AI** tab has a toggle of its own, off until you turn it on, and then two providers.
 
 - **Ollama.** The endpoint defaults to `http://127.0.0.1:11434`. No key. Chats stream back token by
-  token.
+  token. A pasted address that already carries `/v1`, `/api` or `/api/chat` still works, because
+  the path is only added where it is missing.
 - **OpenAI-compatible.** Any endpoint that speaks `/v1/chat/completions` with `stream: true`
-  works, including self-hosted gateways. The key is sent once over the encrypted channel, written
-  to `config.json` with `0600` permissions, and only ever read back in masked form.
+  works, including self-hosted gateways. A bare host, a base that already carries its version
+  (`https://api.deepseek.com/v1`) and the full chat URL are all accepted the same way. The key is
+  sent once over the encrypted channel, written to `config.json` with `0600` permissions, and only
+  ever read back in masked form.
+
+Switching providers replaces the address and the model with the new provider's defaults, so one
+provider's address never leaks into the other.
 
 Setting a key is a write-only affair: the app opens a dialog, sends the key, and shows
 `sk-...1234` from there on. To replace one, use **Set a new key**. To remove one, use **Clear**.
@@ -441,7 +447,8 @@ the indicator up on its own.
 
 **The AI endpoint says nothing is listening.** For Ollama, `ollama serve` has to be running and the
 model in `config.json` has to be pulled already. The gateway also has its own toggle, off by
-default.
+default. When the endpoint answers the probe but a chat still comes back 404, the model name is the
+thing to check, and the AI tab lists the names the endpoint reported.
 
 **A file operation answers `permission` or `denied`.** The path left the shared folder, possibly
 through a symlink, or the host itself does not have the permission. Both are the fence working.

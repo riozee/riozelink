@@ -39,6 +39,35 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === 'object' && value !== null;
 }
 
+/**
+ * Where a request actually goes.
+ *
+ * The endpoint is stored as the user typed it, and people paste what their provider's docs gave
+ * them: a bare host, a base that already carries its version segment (`https://api.deepseek.com/v1`
+ * is DeepSeek's own wording), a full `/v1/chat/completions` URL, or Ollama's OpenAI-compatible
+ * `/v1` address while the Ollama provider is selected. Appending a path to any of those blindly
+ * doubled it (`/v1/v1/chat/completions`), and every request came back 404 whatever the model was
+ * called. The path is only added where it is missing.
+ */
+export function resolveAiUrls(
+	endpoint: string,
+	provider: AiProvider
+): { chat: string; models: string } {
+	const base = endpoint.trim().replace(/\/+$/, '');
+	if (provider === 'ollama') {
+		// The native API lives under `/api`. A pasted `/api`, `/api/chat`, `/api/tags` or `/v1`
+		// (Ollama's own OpenAI-compatible address) still names the same server, so find its root
+		// first and ask the native API.
+		const root = base.replace(/\/(?:v\d+|api(?:\/(?:chat|tags))?)$/i, '');
+		return { chat: `${root}/api/chat`, models: `${root}/api/tags` };
+	}
+	// OpenAI-compatible servers answer under `/v1` from a bare host, or under a base that already
+	// ends in a version segment (DeepSeek, LM Studio, OpenRouter). A second `/v1` is never right.
+	const root = base.replace(/\/(?:chat\/completions|models)$/i, '').replace(/\/+$/, '');
+	if (/\/v\d+$/i.test(root)) return { chat: `${root}/chat/completions`, models: `${root}/models` };
+	return { chat: `${root}/v1/chat/completions`, models: `${root}/v1/models` };
+}
+
 export class AiService {
 	private readonly controllers = new Map<string, AbortController>();
 
@@ -163,8 +192,9 @@ export class AiService {
 		sink: AiStreamSink
 	): Promise<void> {
 		const ai = this.host.config.ai;
+		const { chat } = resolveAiUrls(ai.endpoint, 'ollama');
 		const response = await this.fetchJson(
-			`${ai.endpoint}/api/chat`,
+			chat,
 			{
 				model: payload.model ?? ai.model,
 				messages,
@@ -199,8 +229,9 @@ export class AiService {
 		sink: AiStreamSink
 	): Promise<void> {
 		const ai = this.host.config.ai;
+		const { chat } = resolveAiUrls(ai.endpoint, 'openai');
 		const response = await this.fetchJson(
-			`${ai.endpoint}/v1/chat/completions`,
+			chat,
 			{
 				model: payload.model ?? ai.model,
 				messages,
@@ -312,7 +343,7 @@ export class AiService {
 		apiKey: string
 	): Promise<{ ok: boolean; models: string[] }> {
 		try {
-			const url = provider === 'ollama' ? `${endpoint}/api/tags` : `${endpoint}/v1/models`;
+			const { models: url } = resolveAiUrls(endpoint, provider);
 			const response = await fetch(url, {
 				headers: apiKey ? { authorization: `Bearer ${apiKey}` } : {},
 				signal: AbortSignal.timeout(PROBE_TIMEOUT_MS)
