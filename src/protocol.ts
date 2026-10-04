@@ -400,10 +400,24 @@ export interface AnkiInvokeReply {
 
 export type AiProvider = 'ollama' | 'openai';
 
+/**
+ * One piece of a message. Text is text; an image is a data URL (`data:image/jpeg;base64,…`),
+ * the one spelling both provider dialects accept from us — the gateway maps it to OpenAI's
+ * `image_url` parts or to Ollama's `images` array. The app keeps the render small, and a data
+ * URL past {@link AI_IMAGE_MAX_CHARS} is refused, so one chat request still fits one
+ * DataChannel message (Chromium sends 256 KiB at most).
+ */
+export type AiContentPart =
+	| { type: 'text'; text: string }
+	| { type: 'image'; dataUrl: string };
+
 export interface AiMessage {
 	role: 'system' | 'user' | 'assistant';
-	content: string;
+	content: string | AiContentPart[];
 }
+
+/** The largest image payload one message may carry, in data-URL characters. */
+export const AI_IMAGE_MAX_CHARS = 200_000;
 
 export interface AiStatusReply {
 	/** The user's toggle. Off means the gateway refuses to send anything. */
@@ -419,6 +433,8 @@ export interface AiStatusReply {
 	available: boolean;
 	/** Model names the endpoint reported, when it reports them. */
 	models: string[];
+	/** Whether the settings say the configured model accepts images. */
+	images: boolean;
 }
 
 export interface AiConfigRequest {
@@ -426,6 +442,8 @@ export interface AiConfigRequest {
 	provider?: AiProvider;
 	endpoint?: string;
 	model?: string;
+	/** The configured model accepts images, so message parts may carry them. */
+	images?: boolean;
 }
 
 export interface AiSetKeyRequest {

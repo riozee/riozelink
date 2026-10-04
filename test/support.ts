@@ -488,7 +488,8 @@ export function mockAnki(): { port: number; stop(): void } {
 }
 
 /** A fake Ollama. Streams one word per chunk, so the client has something to concatenate. */
-export function mockOllama(): { port: number; stop(): void } {
+export function mockOllama(): { port: number; stop(): void; bodies: unknown[] } {
+	const bodies: unknown[] = [];
 	const server = Bun.serve({
 		port: 0,
 		fetch: async (request) => {
@@ -497,6 +498,8 @@ export function mockOllama(): { port: number; stop(): void } {
 				return Response.json({ models: [{ name: 'mock:latest' }] });
 			}
 			if (url.pathname === '/api/chat') {
+				const parsed = (await request.json().catch(() => null)) as { messages?: unknown[] } | null;
+				if (parsed) bodies.push(parsed);
 				const words = ['Hello', 'from', 'the', 'mock.'];
 				const encoder = new TextEncoder();
 				const body = new ReadableStream<Uint8Array>({
@@ -518,5 +521,5 @@ export function mockOllama(): { port: number; stop(): void } {
 			return new Response('not found', { status: 404 });
 		}
 	});
-	return { port: server.port as number, stop: () => void server.stop(true) };
+	return { port: server.port as number, stop: () => void server.stop(true), bodies };
 }

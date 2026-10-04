@@ -11,8 +11,10 @@
 import type { HostConfig } from './config.ts';
 import { DEFAULT_ENDPOINTS, DEFAULT_MODELS } from './config.ts';
 import { HostError, requireString } from './errors.ts';
+import { AI_IMAGE_MAX_CHARS } from './protocol.ts';
 import type {
 	AiChatRequest,
+	AiContentPart,
 	AiMessage,
 	AiProvider,
 	AiStatusReply,
@@ -37,6 +39,11 @@ const PROBE_TIMEOUT_MS = 2500;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === 'object' && value !== null;
+}
+
+/** True when a message carries at least one image part. */
+function hasImagePart(message: AiMessage): boolean {
+	return Array.isArray(message.content) && message.content.some((part) => part.type === 'image');
 }
 
 /**
@@ -74,13 +81,14 @@ export class AiService {
 	constructor(private readonly host: AiHost) {}
 
 	async status(): Promise<AiStatusReply> {
-		const { enabled, provider, endpoint, model, apiKey } = this.host.config.ai;
+		const { enabled, provider, endpoint, model, apiKey, images } = this.host.config.ai;
 		const probe = await this.probe(provider, endpoint, apiKey);
 		return {
 			enabled,
 			provider,
 			endpoint,
 			model,
+			images,
 			keySet: apiKey.length > 0,
 			keyMasked: apiKey ? maskKey(apiKey) : null,
 			available: probe.ok,
@@ -93,9 +101,11 @@ export class AiService {
 		provider?: unknown;
 		endpoint?: unknown;
 		model?: unknown;
+		images?: unknown;
 	}): Promise<AiStatusReply> {
 		const ai = this.host.config.ai;
 		if (typeof patch.enabled === 'boolean') ai.enabled = patch.enabled;
+		if (typeof patch.images === 'boolean') ai.images = patch.images;
 		if (patch.provider === 'ollama' || patch.provider === 'openai') {
 			if (patch.provider !== ai.provider) {
 				ai.provider = patch.provider;
@@ -147,18 +157,22 @@ export class AiService {
 
 	async chat(payload: AiChatRequest, sink: AiStreamSink): Promise<void> {
 		const streamId = requireString(payload.streamId, 'streamId');
-		const messages = this.readMessages(payload.messages);
 		const ai = this.host.config.ai;
 		if (!ai.enabled) {
 			throw new HostError('the AI gateway is turned off in riozelink', 'denied');
 		}
 		const controller = new AbortController();
 		this.controllers.set(streamId, controller);
-		this.host.log?.(
-			`ai chat ${streamId} -> ${ai.provider} ${ai.endpoint} (${payload.model ?? ai.model}, ${messages.length} messages)`
-		);
-
 		try {
+			// Validation lives inside the try so a bad payload answers on the stream, where the
+			// client already listens, instead of rejecting a call nobody awaits.
+			const messages = this.readMessages(payload.messages);
+			if (!ai.images && messages.some(hasImagePart)) {
+				throw new HostError('the AI settings say this model does not take images', 'denied');
+			}
+			this.host.log?.(
+				`ai chat ${streamId} -> ${ai.provider} ${ai.endpoint} (${payload.model ?? ai.model}, ${messages.length} messages)`
+			);
 			if (ai.provider === 'ollama') {
 				await this.chatOllama(streamId, payload, messages, controller.signal, sink);
 			} else {
@@ -176,11 +190,69 @@ export class AiService {
 			throw new HostError('a chat needs at least one message', 'invalid');
 		}
 		return value.map((entry, index) => {
-			if (!isRecord(entry) || typeof entry.content !== 'string') {
+			if (!isRecord(entry)) throw new HostError(`message ${index} has no content`, 'invalid');
+			const role = entry.role === 'system' || entry.role === 'assistant' ? entry.role : 'user';
+			if (typeof entry.content === 'string') return { role, content: entry.content };
+			if (!Array.isArray(entry.content) || entry.content.length === 0) {
 				throw new HostError(`message ${index} has no content`, 'invalid');
 			}
-			const role = entry.role === 'system' || entry.role === 'assistant' ? entry.role : 'user';
-			return { role, content: entry.content as string };
+			const content = entry.content.map((part, at) =>
+				this.readPart(part, `message ${index} part ${at}`)
+			);
+			return { role, content };
+		});
+	}
+
+	/** One content part, validated and normalized. */
+	private readPart(value: unknown, where: string): AiContentPart {
+		if (!isRecord(value)) throw new HostError(`${where} is not an object`, 'invalid');
+		if (value.type === 'text' && typeof value.text === 'string') {
+			return { type: 'text', text: value.text };
+		}
+		if (value.type === 'image' && typeof value.dataUrl === 'string') {
+			if (!value.dataUrl.startsWith('data:image/')) {
+				throw new HostError(`${where} is not an image data URL`, 'invalid');
+			}
+			if (value.dataUrl.length > AI_IMAGE_MAX_CHARS) {
+				throw new HostError(
+					`${where} is ${value.dataUrl.length} characters, over the ${AI_IMAGE_MAX_CHARS} an image may take`,
+					'invalid'
+				);
+			}
+			return { type: 'image', dataUrl: value.dataUrl };
+		}
+		throw new HostError(`${where} has an unknown type`, 'invalid');
+	}
+
+	/** The messages in OpenAI's dialect: content arrays carry `image_url` parts. */
+	private toOpenaiMessages(messages: AiMessage[]): unknown[] {
+		return messages.map((message) => ({
+			role: message.role,
+			content:
+				typeof message.content === 'string'
+					? message.content
+					: message.content.map((part) =>
+							part.type === 'text'
+								? { type: 'text', text: part.text }
+								: { type: 'image_url', image_url: { url: part.dataUrl } }
+						)
+		}));
+	}
+
+	/** The messages in Ollama's native dialect: text plus a bare base64 `images` array. */
+	private toOllamaMessages(messages: AiMessage[]): unknown[] {
+		return messages.map((message) => {
+			if (typeof message.content === 'string') {
+				return { role: message.role, content: message.content };
+			}
+			const text = message.content
+				.filter((part): part is { type: 'text'; text: string } => part.type === 'text')
+				.map((part) => part.text)
+				.join('\n');
+			const images = message.content
+				.filter((part): part is { type: 'image'; dataUrl: string } => part.type === 'image')
+				.map((part) => part.dataUrl.slice(part.dataUrl.indexOf(',') + 1));
+			return { role: message.role, content: text, ...(images.length ? { images } : {}) };
 		});
 	}
 
@@ -197,7 +269,7 @@ export class AiService {
 			chat,
 			{
 				model: payload.model ?? ai.model,
-				messages,
+				messages: this.toOllamaMessages(messages),
 				stream: true,
 				...(typeof payload.temperature === 'number'
 					? { options: { temperature: payload.temperature } }
@@ -234,7 +306,7 @@ export class AiService {
 			chat,
 			{
 				model: payload.model ?? ai.model,
-				messages,
+				messages: this.toOpenaiMessages(messages),
 				stream: true,
 				...(typeof payload.temperature === 'number' ? { temperature: payload.temperature } : {})
 			},

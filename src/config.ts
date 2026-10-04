@@ -32,6 +32,8 @@ export interface AiConfig {
 	model: string;
 	/** Write-only from the client's point of view. Never sent back in full. */
 	apiKey: string;
+	/** The configured model accepts images, so a message part may carry one. */
+	images: boolean;
 }
 
 
@@ -95,7 +97,8 @@ export function defaultConfig(): HostConfig {
 			provider: 'ollama',
 			endpoint: DEFAULT_ENDPOINTS.ollama,
 			model: DEFAULT_MODELS.ollama,
-			apiKey: ''
+			apiKey: '',
+			images: false
 		},
 		tunnel: { enabled: false },
 		authorizedClients: {}
@@ -145,6 +148,7 @@ export function normalizeConfig(raw: unknown): HostConfig {
 		if (typeof raw.ai.model === 'string' && raw.ai.model.trim())
 			config.ai.model = raw.ai.model.trim();
 		if (typeof raw.ai.apiKey === 'string') config.ai.apiKey = raw.ai.apiKey;
+		if (typeof raw.ai.images === 'boolean') config.ai.images = raw.ai.images;
 	}
 
 	if (isRecord(raw.tunnel)) {

@@ -169,6 +169,13 @@ The **AI** tab has a toggle of its own, off until you turn it on, and then two p
 Switching providers replaces the address and the model with the new provider's defaults, so one
 provider's address never leaks into the other.
 
+**Images are off until you say otherwise.** Few models take pictures, and a screenshot spends a
+model's budget quickly, so `ai.images` starts false and the StudyDoc assistant renders its page for
+your eyes only. Flip it on and the same tool attaches a smaller JPEG copy to the conversation. The
+daemon maps that onto `image_url` parts for an OpenAI-compatible endpoint and onto `images` entries
+for Ollama. One image may carry up to 200,000 base64 characters, and a model whose settings say it
+takes text only gets a clear refusal rather than a malformed request.
+
 Setting a key is a write-only affair: the app opens a dialog, sends the key, and shows
 `sk-...1234` from there on. To replace one, use **Set a new key**. To remove one, use **Clear**.
 
