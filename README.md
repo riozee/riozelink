@@ -214,6 +214,29 @@ armed runtime is put away at once rather than at its next poll. The honest limit
 not carried yet, request bodies are assembled before the fetch starts, and a site that challenges
 proxies will challenge this one too.
 
+### Updating
+
+Every time a browser connects, the daemon checks `origin/main` for new commits. That moment is the
+point: a reload of riozeOS is usually the same moment a new build lands, so no timer runs in the
+background and an update is seen exactly when it matters. The RiozeLink window shows the answer in
+its Link tab, with a **Check for updates** button, and a notification with an **Update now** button
+appears while a new commit waits. The run reports its steps (pull, dependencies, the type check)
+and is finished once the daemon has restarted and the link came back.
+
+On the terminal panel, `u` does the same: it checks when nothing is known yet, and applies an
+update that is already waiting.
+
+An update is refused rather than forced when the checkout has local changes, has diverged, or sits
+on another branch, and the card shows the reason. When it is taken, the run is a fast-forward pull,
+then `bun install --frozen-lockfile` when `bun.lock` or `package.json` moved, then the project's
+own `check`. If that check fails, the checkout is reverted and the daemon keeps running the old
+code. The restart itself uses `process.execve`, which keeps the same process id, so a terminal job
+never ends and a service manager keeps tracking the same unit. That needs a Bun with
+`process.execve`; on an older one the update is offered with that reason instead.
+
+A copy installed with `bun install -g github:riozee/riozelink` is not a git checkout, so it says so
+and points at the package manager for its updates.
+
 ## The configuration file
 
 `~/.config/riozelink/config.json`, created on first start. It is meant to be edited by hand, and
@@ -264,8 +287,9 @@ their hands off a real home directory.
 | `riozelink clients revoke <name>`               | Forgets one, name and all.                                 |
 | `riozelink status`                              | A summary of the config file, clients included.            |
 
-On the panel, `n` mints a pairing code, `h` shows the first-connection notes, and `q` stops the
-daemon. A daemon running with no panel does the same job on `SIGUSR2`.
+On the panel, `n` mints a pairing code, `u` checks for and takes an update, `h` shows the
+first-connection notes, and `q` stops the daemon. A daemon running with no panel mints on
+`SIGUSR2`.
 
 ## The meeting point
 

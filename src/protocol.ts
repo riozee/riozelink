@@ -18,7 +18,7 @@ import { isPhraseShaped, normalizePhrase } from './words.ts';
 export const PROTOCOL_VERSION = 1;
 
 /** Who a message is for. `auth` runs first; everything else answers once a session is proven. */
-export type RpcSubsystem = 'auth' | 'vfs' | 'tunnel' | 'anki' | 'ai' | 'status';
+export type RpcSubsystem = 'auth' | 'vfs' | 'tunnel' | 'anki' | 'ai' | 'status' | 'update';
 
 /**
  * The envelope of a request. A reply carries the same `id` and an `ok` flag. See {@link RpcWire}
@@ -500,6 +500,8 @@ export interface StatusInfoReply {
 		model: string;
 		keySet: boolean;
 	};
+	/** What this daemon knows about updating itself, or null when no updater is attached. */
+	update: UpdateStatusReply | null;
 }
 
 export interface StatusPingReply {
@@ -509,6 +511,61 @@ export interface StatusPingReply {
 
 export interface StatusClientsEvent {
 	connectedClients: number;
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * update
+ *
+ * The daemon updating itself, demand-driven. No timer watches the remote: a browser asks when it
+ * connects and the answer names what the checkout is behind by, so the app can offer the update
+ * rather than the host having to push. Applying is its own request; the steps stream back as
+ * events, and the last thing a client hears before the link dies is the restart.
+ * ---------------------------------------------------------------------------------------------- */
+
+export type UpdateState =
+	| 'unknown'
+	| 'idle'
+	| 'checking'
+	| 'available'
+	| 'applying'
+	| 'restarting';
+
+export interface UpdateCheckRequest {
+	/** Re-check even when one finished moments ago. The Check button and the panel's `u` set it. */
+	force?: boolean;
+}
+
+export interface UpdateStatusReply {
+	/** False when this daemon does not run from a git checkout, so nothing here applies. */
+	supported: boolean;
+	state: UpdateState;
+	/** The checkout's own commit, short sha. */
+	currentSha: string | null;
+	/** The branch it sits on, `HEAD` when detached. */
+	branch: string | null;
+	/** Commits between the checkout and the remote tip. */
+	behind: number;
+	ahead: number;
+	remoteSha: string | null;
+	/** The remote tip's commit time, epoch ms. */
+	remoteDate: number | null;
+	remoteSubject: string | null;
+	/** When the last check finished, epoch ms. */
+	lastCheckAt: number | null;
+	/** Why the last check or apply did not finish, in the daemon's own words. */
+	lastError: string | null;
+	/** True when an update is waiting and this checkout can take it. */
+	canApply: boolean;
+	/** Why it cannot, when an update waits but taking it would not be safe. */
+	blockReason: string | null;
+}
+
+export type UpdateStep = 'pull' | 'deps' | 'verify' | 'restart';
+
+export interface UpdateProgressEvent {
+	step: UpdateStep;
+	state: 'start' | 'done' | 'failed';
+	message: string;
 }
 
 /* ------------------------------------------------------------------------------------------------
@@ -550,6 +607,9 @@ export interface RpcSpec {
 
 	'status:info': { payload: Record<string, never>; reply: StatusInfoReply };
 	'status:ping': { payload: StatusPingReply; reply: StatusPingReply };
+
+	'update:check': { payload: UpdateCheckRequest; reply: UpdateStatusReply };
+	'update:apply': { payload: Record<string, never>; reply: UpdateStatusReply };
 }
 
 export type RpcAction = keyof RpcSpec;
@@ -566,6 +626,8 @@ export interface RpcEvents {
 	'ai:end': AiEndEvent;
 	'ai:error': AiStreamErrorEvent;
 	'status:clients': StatusClientsEvent;
+	'update:status': UpdateStatusReply;
+	'update:progress': UpdateProgressEvent;
 }
 
 export type RpcEventName = keyof RpcEvents;

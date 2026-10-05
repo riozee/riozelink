@@ -95,6 +95,10 @@ export class Dashboard {
 			this.host.mintPairingCode();
 			return;
 		}
+		if (key === 'u') {
+			void this.host.panelUpdate();
+			return;
+		}
 		if (key === 'h') {
 			this.help = !this.help;
 			this.render();
@@ -156,6 +160,20 @@ export class Dashboard {
 		);
 		lines.push(`${this.paint('code     ', 'dim')} ${codeLine}`);
 		lines.push(`${this.paint('clients  ', 'dim')} ${state}`);
+		const update = host.updateStatus();
+		if (update?.supported) {
+			let text: string | null = null;
+			let tone: keyof typeof color = 'dim';
+			if (update.state === 'available') {
+				text = update.canApply
+					? `${update.behind} new commit${update.behind === 1 ? '' : 's'} on ${update.branch} · press u`
+					: `an update is waiting, but ${update.blockReason}`;
+				tone = update.canApply ? 'green' : 'yellow';
+			} else if (update.state === 'applying' || update.state === 'restarting') {
+				text = 'applying…';
+			}
+			if (text) lines.push(`${this.paint('update   ', 'dim')} ${this.paint(text, tone)}`);
+		}
 		const shares = Object.entries(host.shares());
 		if (shares.length === 0) {
 			lines.push(`${this.paint('shares   ', 'dim')} ${this.paint('none yet', 'dim')}`);
@@ -182,7 +200,7 @@ export class Dashboard {
 
 		if (this.tty) {
 			lines.push('');
-			lines.push(this.paint('[n] mint a code   [h] help   [q] quit', 'dim'));
+			lines.push(this.paint('[n] mint a code   [u] update   [h] help   [q] quit', 'dim'));
 		}
 		return lines;
 	}

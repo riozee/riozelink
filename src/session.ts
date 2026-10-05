@@ -31,7 +31,8 @@ import {
 	type RpcErrorInfo,
 	type RpcSubsystem,
 	type RpcWire,
-	type StatusInfoReply
+	type StatusInfoReply,
+	type UpdateStatusReply
 } from './protocol.ts';
 import { displayPath, fromBase64, randomId, randomNonce, toBase64, truncate } from './util.ts';
 import * as vfsOps from './vfs.ts';
@@ -59,6 +60,10 @@ export interface SessionHost {
 	ankiChanged(): Promise<void>;
 	/** The browsing tunnel toggle. The harder switch: while it is off, no tunnel request moves. */
 	setTunnelEnabled(enabled: boolean): Promise<boolean>;
+	/** The demand-driven update check a browser sends when it connects. */
+	checkForUpdate(force: boolean): Promise<UpdateStatusReply>;
+	/** Starts the update run. Answers with the state as the run begins. */
+	applyUpdate(): UpdateStatusReply;
 	sessionClosed(session: ClientSession): void;
 	readonly ai: AiService;
 	readonly anki: AnkiService;
@@ -215,6 +220,8 @@ export class ClientSession {
 				return this.handleAi(action, payload);
 			case 'status':
 				return this.handleStatus(action, payload);
+			case 'update':
+				return this.handleUpdate(action, payload);
 			default:
 				throw new HostError(`unknown subsystem: ${subsystem}`, 'unsupported');
 		}
@@ -509,6 +516,23 @@ export class ClientSession {
 				return { t: typeof payload.t === 'number' ? payload.t : 0 };
 			default:
 				throw new HostError(`unknown status action: ${action}`, 'unsupported');
+		}
+	}
+
+	/* -------------------------------------------------------------------- update ------- */
+
+	private async handleUpdate(action: string, raw: unknown): Promise<unknown> {
+		const payload = (raw ?? {}) as Record<string, unknown>;
+		switch (action) {
+			case 'check':
+				return this.host.checkForUpdate(payload.force === true);
+			case 'apply': {
+				const status = this.host.applyUpdate();
+				this.host.log('info', `${this.clientLabel || this.clientName} started an update`);
+				return status;
+			}
+			default:
+				throw new HostError(`unknown update action: ${action}`, 'unsupported');
 		}
 	}
 }

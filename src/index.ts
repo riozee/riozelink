@@ -14,9 +14,11 @@
  */
 import { stat } from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { configFilePath, loadConfig, saveConfig, uniqueShareId } from './config.ts';
 import { Dashboard } from './dashboard.ts';
 import { HOST_VERSION, RiozeLinkHost } from './host.ts';
+import { Updater } from './update.ts';
 import { displayPath, maskKey, truncate } from './util.ts';
 import { displayPhrase } from './words.ts';
 
@@ -115,6 +117,23 @@ async function serve(args: ParsedArgs): Promise<void> {
 		// is a service nobody can diagnose.
 		onLog: quiet ? (entry) => process.stdout.write(`${entry.level} ${entry.message}\n`) : undefined
 	});
+	// The panel is created further down, but the updater's restart needs somewhere to put it back.
+	let dashboard: Dashboard | null = null;
+	const updater = new Updater({
+		repoDir: fileURLToPath(new URL('..', import.meta.url)),
+		log: (level, message) => host.log(level, message),
+		onStatus: (status) => host.broadcastEvent('update', 'status', status),
+		onProgress: (event) => host.broadcastEvent('update', 'progress', event),
+		// The one way this process ends without the user asking. `execve` keeps the pid, so a
+		// terminal job stays this job and a service manager keeps tracking the same unit.
+		restart: async () => {
+			dashboard?.stop();
+			await host.stop('updating to a newer version');
+			execSelf();
+		}
+	});
+	await updater.init();
+	host.setUpdater(updater);
 	await host.start();
 
 	if (process.platform !== 'win32') {
@@ -136,7 +155,7 @@ async function serve(args: ParsedArgs): Promise<void> {
 		process.stdout.write(code ? `code ${displayPhrase(code)}\n` : `code none, ${hint} for one\n`);
 	}
 
-	const dashboard = quiet
+	dashboard = quiet
 		? null
 		: new Dashboard(host, {
 				onQuit: () => void shutdown('stopped from the panel')
@@ -159,6 +178,28 @@ async function serve(args: ParsedArgs): Promise<void> {
 		// Stay alive without a panel; the process is the service.
 		await new Promise(() => undefined);
 	}
+}
+
+/**
+ * Replaces this process with a fresh run of the same command, from the files the update just
+ * wrote. Bun's `process.execve` keeps the pid, so the terminal job never ends and the shell never
+ * gets its prompt back in the middle of an update. A Bun without it answers with a blocked
+ * update rather than a half-applied one.
+ */
+function execSelf(): void {
+	const execve = (
+		process as unknown as {
+			execve?: (
+				file: string,
+				argv: string[],
+				env?: Record<string, string | undefined>
+			) => never;
+		}
+	).execve;
+	if (typeof execve !== 'function') {
+		throw new Error('this Bun version cannot restart the daemon in place');
+	}
+	execve(process.execPath, process.argv, process.env);
 }
 
 async function folders(args: ParsedArgs): Promise<void> {

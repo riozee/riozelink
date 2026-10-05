@@ -40,10 +40,12 @@ import {
 	type AnkiStatusReply,
 	type RelayMessage,
 	type RpcSubsystem,
-	type StatusInfoReply
+	type StatusInfoReply,
+	type UpdateStatusReply
 } from './protocol.ts';
 import { SignalLink } from './signal.ts';
 import { ClientSession, type SessionHost } from './session.ts';
+import { unsupportedUpdateStatus, type Updater } from './update.ts';
 import { ShareWatcher, sharesReply, sweepPartials } from './vfs.ts';
 import { displayPath, formatDuration, truncate } from './util.ts';
 import { generatePhrase } from './words.ts';
@@ -103,6 +105,8 @@ export class RiozeLinkHost implements SessionHost {
 	readonly ai: AiService;
 
 	private readonly options: RiozeLinkHostOptions;
+	/** The daemon's own updater, attached by the entry point once the checkout is known. */
+	private updaterRef: Updater | null = null;
 	/** How long a minted code is good for. Three minutes unless a test says otherwise. */
 	private readonly pairingTtlMs: number;
 	private readonly sessions = new Map<string, ClientSession>();
@@ -523,7 +527,8 @@ export class RiozeLinkHost implements SessionHost {
 				provider: this.config.ai.provider,
 				model: this.config.ai.model,
 				keySet: this.config.ai.apiKey.length > 0
-			}
+			},
+			update: this.updaterRef ? this.updaterRef.status() : null
 		};
 	}
 
@@ -553,6 +558,90 @@ export class RiozeLinkHost implements SessionHost {
 		this.broadcastEvent('tunnel', 'status', { enabled: this.config.tunnel.enabled });
 		this.notify();
 		return this.config.tunnel.enabled;
+	}
+
+	/* -------------------------------------------------------------------- update ------- */
+
+	/** The entry point hands the updater in; a headless test leaves it null. */
+	setUpdater(updater: Updater): void {
+		this.updaterRef = updater;
+	}
+
+	updateStatus(): UpdateStatusReply | null {
+		return this.updaterRef ? this.updaterRef.status() : null;
+	}
+
+	/** The demand-driven check a browser sends when it connects. */
+	checkForUpdate(force: boolean): Promise<UpdateStatusReply> {
+		if (!this.updaterRef || !this.updaterRef.status().supported) {
+			// A package-manager install is a legitimate daemon; it answers honestly instead of
+			// failing, so the app can say how updates work for that copy.
+			return Promise.resolve(unsupportedUpdateStatus());
+		}
+		return this.updaterRef.check(force);
+	}
+
+	/**
+	 * Takes the update. Answered immediately with the state as the run begins; the run itself
+	 * streams as `update:progress` events and ends when this process replaces itself.
+	 */
+	applyUpdate(): UpdateStatusReply {
+		const updater = this.requireUpdater();
+		const status = updater.status();
+		if (status.state !== 'available' || !status.canApply) {
+			throw new HostError(status.blockReason ?? 'there is nothing to update', 'invalid');
+		}
+		this.log('info', `updating to ${status.remoteSha ?? 'the newest version'}`);
+		void updater.apply();
+		return updater.status();
+	}
+
+	/**
+	 * The panel's `u`. A key press is a person asking, so an unknown state means "go look": it
+	 * checks and reports, and leaves the applying to the next press.
+	 */
+	async panelUpdate(): Promise<void> {
+		const updater = this.updaterRef;
+		if (!updater || !updater.status().supported) {
+			this.log('warn', 'this daemon does not run from a git checkout, so it cannot update itself');
+			return;
+		}
+		const before = updater.status();
+		if (before.state === 'applying' || before.state === 'restarting') {
+			this.log('info', 'an update is already running');
+			return;
+		}
+		if (before.state === 'available') {
+			if (!before.canApply) {
+				this.log('warn', `an update is waiting, but ${before.blockReason}`);
+				return;
+			}
+			try {
+				this.applyUpdate();
+			} catch (error) {
+				this.log('warn', error instanceof Error ? error.message : String(error));
+			}
+			return;
+		}
+		const fresh = await updater.check(true);
+		if (fresh.state === 'available') {
+			const count = fresh.behind === 1 ? 'one new commit' : `${fresh.behind} new commits`;
+			this.log('info', `${count} on ${fresh.branch}. Press u to update`);
+		} else if (fresh.lastError) {
+			this.log('warn', fresh.lastError);
+		} else {
+			this.log('info', 'the daemon is up to date');
+		}
+	}
+
+	private requireUpdater(): Updater {
+		if (!this.updaterRef || !this.updaterRef.status().supported) {
+			throw new HostError(
+				'this daemon does not run from a git checkout, so it updates with your package manager',
+				'unsupported'
+			);
+		}
+		return this.updaterRef;
 	}
 
 	/* ----------------------------------------------------------------------- log ------- */
