@@ -32,6 +32,7 @@ import { HostError } from './errors.ts';
 import { loadOrCreateIdentity, type HostIdentity } from './identity.ts';
 import { createPeerLink, type PeerLink } from './peer.ts';
 import {
+	BULK_LABEL,
 	linkRoom,
 	pairRoom,
 	pairProof,
@@ -307,6 +308,20 @@ export class RiozeLinkHost implements SessionHost {
 	}
 
 	private attachChannel(entry: HostLink, channel: RTCDataChannel): void {
+		if (channel.label === BULK_LABEL) {
+			// The binary channel belongs to the session the control channel opened. One with no session
+			// behind it has nothing to carry, so it is closed rather than kept.
+			if (entry.session && entry.session.phase !== 'closed') {
+				entry.session.attachBulk(channel);
+			} else {
+				try {
+					channel.close();
+				} catch {
+					// Already gone.
+				}
+			}
+			return;
+		}
 		if (entry.session && entry.session.phase !== 'closed') {
 			entry.session.dispose('a new link took over');
 		}

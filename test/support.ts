@@ -10,6 +10,9 @@ import type { ServerWebSocket } from 'bun';
 import { RTCPeerConnection, type RTCDataChannel } from 'werift';
 import { fingerprintOfPublicKey } from '../src/identity.ts';
 import {
+	BULK_FLAG_LAST,
+	BULK_HEADER,
+	BULK_LABEL,
 	linkRoom,
 	makePeerId,
 	pairProof,
@@ -291,6 +294,10 @@ export class TestClient {
 		resolve: (event: TestEvent) => void;
 	}> = [];
 	private seq = 0;
+	/** The binary channel, when the test opened one. Read slices arrive on it as frames. */
+	bulk: RTCDataChannel | null = null;
+	private bulkSeq = 0;
+	private readonly bulkWaiters = new Map<number, (frame: { bytes: Buffer; last: boolean }) => void>();
 
 	private send(message: RelayOutgoing): void {
 		this.socket.send(JSON.stringify({ ...message, room: this.room, from: this.id, ts: Date.now() }));
@@ -394,6 +401,71 @@ export class TestClient {
 			timeoutMs,
 			`the ${key} event`
 		);
+	}
+
+	/**
+	 * Opens the second channel exactly where the browser app does: after auth, because the host
+	 * advertised how much one frame may carry.
+	 */
+	async openBulk(): Promise<void> {
+		const channel = this.peer.createDataChannel(BULK_LABEL, { ordered: true });
+		this.bulk = channel;
+		channel.onMessage.subscribe((data) => {
+			if (typeof data === 'string' || data.length < BULK_HEADER) return;
+			const seq = data.readUInt32LE(4);
+			const waiter = this.bulkWaiters.get(seq);
+			if (!waiter) return;
+			this.bulkWaiters.delete(seq);
+			waiter({
+				bytes: Buffer.from(data.subarray(BULK_HEADER)),
+				last: (data.readUInt8(1) & BULK_FLAG_LAST) !== 0
+			});
+		});
+		if (channel.readyState === 'open') return;
+		await withTimeout(
+			new Promise<void>((resolve) => {
+				channel.stateChange.subscribe((state) => {
+					if (state === 'open') resolve();
+				});
+			}),
+			CHANNEL_TIMEOUT_MS,
+			'the bulk channel'
+		);
+	}
+
+	/**
+	 * One read whose bytes come back as a frame. The control reply is required to be metadata
+	 * alone: a JSON slice here would be a short chunk the pipeline never asked for.
+	 */
+	async readBulk(
+		share: string,
+		path: string,
+		offset: number,
+		length: number
+	): Promise<{ bytes: Buffer; last: boolean; meta: { size: number; bytes?: number } }> {
+		if (!this.bulk) throw new Error('open the bulk channel first');
+		this.bulkSeq += 1;
+		const seq = this.bulkSeq;
+		const frame = new Promise<{ bytes: Buffer; last: boolean }>((resolve) => {
+			this.bulkWaiters.set(seq, resolve);
+		});
+		let meta: { size: number; bytes?: number; data?: string };
+		try {
+			meta = (await this.call('vfs', 'read', { share, path, offset, length, seq })) as {
+				size: number;
+				bytes?: number;
+				data?: string;
+			};
+		} catch (error) {
+			this.bulkWaiters.delete(seq);
+			throw error;
+		}
+		if (typeof meta.data === 'string') {
+			this.bulkWaiters.delete(seq);
+			throw new Error('the host answered a bulk read with a JSON slice');
+		}
+		const settled = await withTimeout(frame, CALL_TIMEOUT_MS, `the bulk frame for ${path}`);
+		return { ...settled, meta };
 	}
 
 	private async sign(data: Uint8Array<ArrayBuffer>): Promise<string> {

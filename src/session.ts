@@ -24,6 +24,11 @@ import {
 	type HostIdentity
 } from './identity.ts';
 import {
+	BULK_FLAG_LAST,
+	BULK_HEADER,
+	BULK_KIND_READ,
+	BULK_MARGIN,
+	BULK_MAX_FRAME,
 	PROTOCOL_VERSION,
 	type AiChatRequest,
 	type AuthHelloPayload,
@@ -32,7 +37,8 @@ import {
 	type RpcSubsystem,
 	type RpcWire,
 	type StatusInfoReply,
-	type UpdateStatusReply
+	type UpdateStatusReply,
+	type VfsReadReply
 } from './protocol.ts';
 import { displayPath, fromBase64, randomId, randomNonce, toBase64, truncate } from './util.ts';
 import * as vfsOps from './vfs.ts';
@@ -82,6 +88,14 @@ function cleanName(value: unknown): string {
 	return truncate(stripped || 'Browser', 48);
 }
 
+/** The `seq` of a bulk read request: a positive 32 bit integer, or null when it is not one. */
+function bulkSeqOf(value: unknown): number | null {
+	if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0 || value > 0xffffffff) {
+		return null;
+	}
+	return value;
+}
+
 export class ClientSession {
 	readonly id = randomId();
 	readonly joinedAt = Date.now();
@@ -97,6 +111,11 @@ export class ClientSession {
 	private authFailures = 0;
 	private readonly uploads: UploadTable = new Map();
 	private readonly aiStreams = new Set<string>();
+	/**
+	 * The binary channel, when this client opened one. Read slices answer on it as raw frames, so
+	 * nothing large shares a stream with the control traffic.
+	 */
+	private bulkChannel: RTCDataChannel | null = null;
 	/** The browsing tunnel: one native fetch per stream, nothing remembered between them. */
 	private readonly tunnel: TunnelSession;
 	private readonly helloDeadline: NodeJS.Timeout;
@@ -150,6 +169,66 @@ export class ClientSession {
 		this.sendText(JSON.stringify({ kind: 'evt', subsystem, action, payload } satisfies RpcWire));
 	}
 
+	/**
+	 * Takes the binary channel this client opened after auth. Read slices answer on it from now on;
+	 * the control channel keeps its JSON shape for everything else.
+	 */
+	attachBulk(channel: RTCDataChannel): void {
+		if (this.phase === 'closed') {
+			try {
+				channel.close();
+			} catch {
+				// Already gone.
+			}
+			return;
+		}
+		if (this.bulkChannel && this.bulkChannel !== channel) {
+			try {
+				this.bulkChannel.close();
+			} catch {
+				// Already gone.
+			}
+		}
+		this.bulkChannel = channel;
+		channel.stateChange.subscribe((state) => {
+			if (state === 'closed' && this.bulkChannel === channel) this.bulkChannel = null;
+		});
+		this.host.log('info', `the binary channel is open for ${this.clientLabel || this.clientName}`);
+	}
+
+	/**
+	 * The largest payload one frame may carry.
+	 *
+	 * The browser says in its SDP how big a message it can receive, and the SCTP layer refuses
+	 * anything larger, so the promise to the client is a little under that, minus the header and a
+	 * margin. The client sizes its read requests from this exact number, which is what keeps every
+	 * frame but the last full: the pipeline never has to look at where a slice ended.
+	 */
+	private bulkPayload(): number {
+		const remote = this.channel.sctp?.remoteMaxMessageSize ?? 0;
+		const budget = remote > 0 ? Math.min(remote, BULK_MAX_FRAME) : BULK_MAX_FRAME;
+		return Math.max(1024, budget - BULK_HEADER - BULK_MARGIN);
+	}
+
+	/** One binary frame. False when the channel is gone, so the caller can say so instead of lying. */
+	private sendBulkFrame(seq: number, last: boolean, bytes: Buffer): boolean {
+		const channel = this.bulkChannel;
+		if (!channel || channel.readyState !== 'open') return false;
+		const frame = Buffer.allocUnsafe(BULK_HEADER + bytes.length);
+		frame.writeUInt8(BULK_KIND_READ, 0);
+		frame.writeUInt8(last ? BULK_FLAG_LAST : 0, 1);
+		frame.writeUInt16LE(0, 2);
+		frame.writeUInt32LE(seq >>> 0, 4);
+		bytes.copy(frame, BULK_HEADER);
+		try {
+			channel.send(frame);
+			return true;
+		} catch (error) {
+			this.host.log('warn', `could not send a frame: ${(error as Error).message}`);
+			return false;
+		}
+	}
+
 	dispose(reason: string): void {
 		if (this.phase === 'closed') return;
 		this.phase = 'closed';
@@ -160,6 +239,14 @@ export class ClientSession {
 		this.aiStreams.clear();
 		// Every tunnel stream this session was carrying stops with it; the fetches are aborted.
 		this.tunnel.dispose();
+		if (this.bulkChannel) {
+			try {
+				this.bulkChannel.close();
+			} catch {
+				// Already gone.
+			}
+			this.bulkChannel = null;
+		}
 		try {
 			this.channel.close();
 		} catch {
@@ -343,7 +430,8 @@ export class ClientSession {
 			hostName: this.host.hostName,
 			hostVersion: this.host.hostVersion,
 			hostFingerprint: this.host.identity.fingerprint,
-			serverTime: Date.now()
+			serverTime: Date.now(),
+			bulk: this.bulkPayload()
 		};
 	}
 
@@ -364,7 +452,7 @@ export class ClientSession {
 			case 'stat':
 				return vfsOps.statShare(this.shareOf(payload), requireString(payload.path, 'path'));
 			case 'read':
-				return vfsOps.readShare(this.shareOf(payload), payload);
+				return this.readSlice(payload);
 			case 'write':
 				return vfsOps.writeShare(this.uploads, this.shareOf(payload), payload);
 			case 'mkdir':
@@ -401,6 +489,37 @@ export class ClientSession {
 			default:
 				throw new HostError(`unknown vfs action: ${action}`, 'unsupported');
 		}
+	}
+
+	/**
+	 * One read, in whichever shape the client asked for.
+	 *
+	 * A request carrying a `seq` wants a binary frame, and what comes back here is only the
+	 * metadata. If the channel is gone the read fails outright: answering with a JSON slice the
+	 * client did not pipeline for would hand it a short chunk mid-file, which is worse than an
+	 * error. Everything else keeps the JSON shape it always had.
+	 */
+	private async readSlice(payload: Record<string, unknown>): Promise<VfsReadReply> {
+		const share = this.shareOf(payload);
+		const seq = payload.seq === undefined ? null : bulkSeqOf(payload.seq);
+		if (payload.seq !== undefined && seq === null) {
+			throw new HostError('the read sequence is not a 32 bit number', 'invalid');
+		}
+		if (seq === null) {
+			const slice = await vfsOps.readShare(share, payload);
+			return { data: toBase64(slice.bytes), size: slice.size, done: slice.done };
+		}
+		if (!this.bulkChannel || this.bulkChannel.readyState !== 'open') {
+			throw new HostError(
+				'the binary channel is not open, so no frame can carry this read',
+				'io'
+			);
+		}
+		const slice = await vfsOps.readShare(share, payload, this.bulkPayload());
+		if (!this.sendBulkFrame(seq, slice.done, slice.bytes)) {
+			throw new HostError('the binary channel closed before the slice could be sent', 'io');
+		}
+		return { size: slice.size, bytes: slice.bytes.length };
 	}
 
 	/* -------------------------------------------------------------------- tunnel ------- */

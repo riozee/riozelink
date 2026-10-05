@@ -70,6 +70,52 @@ export type RpcWire =
 export const VFS_CHUNK = 45 * 1024;
 
 /* ------------------------------------------------------------------------------------------------
+ * the bulk channel
+ *
+ * JSON file chunks are paced one reply per request, so a transfer runs at one 45 KiB slice per
+ * round trip and the link's latency sets the speed. Two additions lift that ceiling without
+ * breaking anything that already works:
+ *
+ * - A second, ordered DataChannel (`BULK_LABEL`) carries raw binary frames. The host opens it
+ *   only when the client asks, which it learns it may from {@link AuthOkPayload.bulk}: with the
+ *   base64 tax gone, a binary frame can carry as much as the receiving stack advertises for one
+ *   message.
+ * - The client pipelines reads. It keeps several `vfs:read` requests in flight, each carrying a
+ *   `seq`, and the host answers each with one frame whose `seq` names the request. Frames may
+ *   complete out of order; the header is what ties them back together.
+ *
+ * A frame is 8 bytes of header and the raw bytes behind it:
+ *
+ *   byte 0      kind          (BULK_KIND_READ)
+ *   byte 1      flags         (bit 0: BULK_FLAG_LAST)
+ *   bytes 2..3  reserved      0
+ *   bytes 4..7  seq           the `seq` of the request, little-endian u32
+ *
+ * The two channels are independent streams inside one SCTP association, so a large frame never
+ * delays an event or a reply behind it, and the control channel keeps its one-reply-per-request
+ * shape. A `vfs:read` that carried a `seq` is answered by the frame; its control reply is the
+ * metadata alone. Anything else about the request, errors included, still travels over the
+ * control channel exactly as before.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** Label of the second channel. Both ends match a channel to its job by this name. */
+export const BULK_LABEL = 'rioze-bulk';
+/** Bytes of header in front of every bulk frame. */
+export const BULK_HEADER = 8;
+/** A frame carrying the bytes of one `vfs:read`. */
+export const BULK_KIND_READ = 1;
+/** Flag bit: this frame reaches the end of the file. */
+export const BULK_FLAG_LAST = 1;
+/** Whether we are willing to send this much in one frame, whatever the peer says it can take. */
+export const BULK_MAX_FRAME = 256 * 1024;
+/**
+ * Slack kept between a frame and the peer's advertised message limit. The RFC counts the whole
+ * message, and this is a protocol where being one byte over closes the association rather than
+ * costing one retry.
+ */
+export const BULK_MARGIN = 512;
+
+/* ------------------------------------------------------------------------------------------------
  * auth
  *
  * The client generates an ECDSA P-256 key pair (non-extractable private key, stored in the
@@ -132,6 +178,15 @@ export interface AuthOkPayload {
 	hostFingerprint: string;
 	/** Host clock, epoch ms. */
 	serverTime: number;
+	/**
+	 * The largest payload one binary frame on the bulk channel may carry, in raw bytes.
+	 *
+	 * Present when this host can answer reads with bulk frames; absent from hosts that only
+	 * speak the chunked JSON read (see the bulk channel section above). The client asks for
+	 * slices of exactly this size, which is what lets it pipeline reads without ever having to
+	 * look at where a slice ended: every frame but the last is this long.
+	 */
+	bulk?: number;
 }
 
 /* ------------------------------------------------------------------------------------------------
@@ -173,15 +228,23 @@ export interface VfsReadRequest {
 	path: string;
 	offset: number;
 	length: number;
+	/**
+	 * When present, the slice may travel as a binary frame on the bulk channel instead of as
+	 * base64 inside the reply, and this number names the frame. The host falls back to the JSON
+	 * shape only when the request arrives without a `seq`.
+	 */
+	seq?: number;
 }
 
 export interface VfsReadReply {
-	/** Base64 of the slice. */
-	data: string;
+	/** Base64 of the slice. Present on the JSON shape, absent when a bulk frame carried the bytes. */
+	data?: string;
 	/** Whole file size. */
 	size: number;
-	/** True when this slice reaches the end of the file. */
-	done: boolean;
+	/** True when this slice reaches the end of the file. Absent on a bulk reply; the frame carries the end. */
+	done?: boolean;
+	/** Raw byte count that went out on the bulk channel, on a bulk reply. */
+	bytes?: number;
 }
 
 export interface VfsWriteRequest {

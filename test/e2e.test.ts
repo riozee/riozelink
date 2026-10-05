@@ -323,6 +323,81 @@ test(
 );
 
 test(
+	'a bulk read without its channel is refused, never answered with a short slice',
+	async () => {
+		await writeFile(path.join(shareDir, 'frame.txt'), 'frame me');
+		const refusal = await primary.expectFailure('vfs', 'read', {
+			share: 'notes',
+			path: '/frame.txt',
+			offset: 0,
+			length: 4096,
+			seq: 7
+		});
+		expect(refusal.code).toBe('io');
+	},
+	TEST_TIMEOUT
+);
+
+test(
+	'pipelined reads answer as binary frames that name their request',
+	async () => {
+		const advertised = primaryAuth.bulk;
+		expect(typeof advertised).toBe('number');
+		const stride = advertised as number;
+		expect(stride).toBeGreaterThan(1024);
+
+		// A file that spans several frames and ends on a real tail.
+		const size = stride * 5 + 137;
+		const payload = Buffer.alloc(size);
+		for (let index = 0; index < payload.length; index += 1) {
+			payload[index] = (index * 31 + 7) & 0xff;
+		}
+		await writeFile(path.join(shareDir, 'frames.bin'), payload);
+
+		await primary.openBulk();
+
+		// Five reads in flight at once. The frames may complete in any order, and each one still
+		// has to hold the slice its own seq asked for.
+		const parts: Buffer[] = [];
+		for (let base = 0; base < size; base += stride * 5) {
+			const window: Array<Promise<{ bytes: Buffer; last: boolean }>> = [];
+			for (let index = 0; index < 5; index += 1) {
+				const offset = base + index * stride;
+				if (offset >= size) break;
+				window.push(primary.readBulk('notes', '/frames.bin', offset, stride));
+			}
+			for (const frame of await Promise.all(window)) parts.push(frame.bytes);
+		}
+		const assembled = Buffer.concat(parts);
+		expect(assembled.length).toBe(size);
+		expect(assembled.equals(payload)).toBe(true);
+
+		// The tail is short and carries the end; past the end is an empty final frame.
+		const tail = await primary.readBulk('notes', '/frames.bin', size - 10, stride);
+		expect(tail.bytes.length).toBe(10);
+		expect(tail.last).toBe(true);
+		expect(tail.meta.bytes).toBe(10);
+		const past = await primary.readBulk('notes', '/frames.bin', size, stride);
+		expect(past.bytes.length).toBe(0);
+		expect(past.last).toBe(true);
+
+		// An error travels beside a frame without disturbing it.
+		const missing = primary.expectFailure('vfs', 'read', {
+			share: 'notes',
+			path: '/not-here.bin',
+			offset: 0,
+			length: stride,
+			seq: 424242
+		});
+		const beside = primary.readBulk('notes', '/frames.bin', 0, stride);
+		expect((await missing).code).toBe('not-found');
+		const first = await beside;
+		expect(first.bytes.equals(payload.subarray(0, stride))).toBe(true);
+	},
+	TEST_TIMEOUT
+);
+
+test(
 	'Anki is off by default, turns on, answers and reports failures',
 	async () => {
 		const off = (await primary.call('anki', 'status')) as { enabled: boolean; reachable: boolean };

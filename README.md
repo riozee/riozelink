@@ -331,9 +331,9 @@ this design that costs money to run.
 | ------------- | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
 | The code      | `src/words.ts`                 | 534 plain words and Crockford's 32 characters. Four of each, about 56 bits, no confusable pairs.                             |
 | The relay     | `src/signal.ts`                | One socket per room, frames taken verbatim, reconnects with backoff.                                                        |
-| WebRTC link   | `src/peer.ts`                  | Answers the browser's offer, trickles candidates, hands over the DataChannel.                                                |
+| WebRTC link   | `src/peer.ts`                  | Answers the browser's offer, trickles candidates, hands over the DataChannel, and accepts the second channel a client opens for binary read frames.                                        |
 | Auth          | `src/session.ts`               | Hello, proof, pairing. Every other message waits behind it.                                                                  |
-| Filesystem    | `src/vfs.ts`, `src/sandbox.ts` | Path fence, chunked reads and writes, part files, change watching.                                                           |
+| Filesystem    | `src/vfs.ts`, `src/sandbox.ts` | Path fence, pipelined reads, chunked part-file writes, change watching.                                                      |
 | Anki          | `src/anki.ts`                  | One toggle, a five-second probe, and a POST to the loopback.                                                                 |
 | AI            | `src/ai.ts`                    | Two dialects, one streaming shape, keys stay here.                                                                           |
 | Tunnel        | `src/tunnel.ts`                | One `fetch` per exchange, the response sliced back to the browser, no cookie jar and no redirect following.                                |
@@ -348,16 +348,23 @@ does not know or care that a drive is far away.
 1. riozeOS asks its filesystem layer for `/riozeos/drives/notes/sub/list.txt`.
 2. The mount table sees the path sits inside a mounted remote drive and hands the request to the
    remote backend with the prefix stripped. The backend sees `/sub/list.txt`.
-3. The backend sends `vfs:read` with the share id and an offset, and asks for at most 45 KB.
+3. The backend keeps eight `vfs:read` requests in flight at once, each with the share id, an
+   offset, and a `seq`, so the link's latency no longer sets a transfer's speed.
 4. The daemon normalizes the path, walks it up to the deepest existing part, asks the OS for that
    part's real location, and refuses the whole call if the real location is outside the shared
    folder. Symlinks cannot smuggle anything out.
-5. The daemon reads the slice, base64-encodes it, and answers. The client keeps asking until a
-   reply says `done`.
+5. The daemon reads the slice and answers with a binary frame on the second DataChannel, as large
+   as the browser's own SDP said it can receive (255 KB on Chromium, 64 KB on Safari). The
+   frame's header carries the `seq`, so a reply that finishes out of order still finds its
+   request, and the JSON reply behind it is metadata alone.
 
-45 KB per message is not a round number on purpose. Base64 grows it by a third, and the result has
-to stay under the 64 KB message size some WebRTC stacks advertise. Chunks that fit everywhere beat
-chunks that are fast on paper.
+A slice is 45 KB and base64-encoded only when the client is older than the bulk channel. The
+client knows the option exists because the auth reply carries `bulk`, the largest payload one
+frame may hold, derived from the browser's advertised message limit; a `vfs:read` without a `seq`
+is answered in the JSON reply exactly as it always was, and the browser pipelines those chunks the
+same way. That is what lets a browser and a daemon be updated weeks apart — and why 45 KB is not a
+round number: base64 grows it by a third, and the result has to stay under the 64 KB message size
+some WebRTC stacks advertise.
 
 ### The life of one file write
 

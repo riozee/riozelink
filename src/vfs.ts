@@ -21,13 +21,12 @@ import type {
 	RemoteEntry,
 	VfsChangedEvent,
 	VfsListReply,
-	VfsReadReply,
 	VfsSharesReply,
 	VfsStatReply,
 	VfsWriteReply
 } from './protocol.ts';
 import { VFS_CHUNK } from './protocol.ts';
-import { fromBase64, randomId, toBase64 } from './util.ts';
+import { fromBase64, randomId } from './util.ts';
 import { realShareRoot, resolveSharePath, toRemotePath } from './sandbox.ts';
 
 const PART_PREFIX = '.riozelink-part-';
@@ -76,10 +75,26 @@ export async function statShare(share: ShareRecord, remotePath: string): Promise
 	}
 }
 
+/** One slice of a file, as raw bytes. The caller decides how it travels: base64 JSON, or a frame. */
+export interface VfsReadChunk {
+	bytes: Buffer;
+	size: number;
+	done: boolean;
+}
+
+/**
+ * One slice of a file.
+ *
+ * `maxLength` is how much one reply may carry: the JSON read keeps {@link VFS_CHUNK}, and the
+ * bulk channel passes the size it promised the client. Every slice but the last is exactly that
+ * long — the client pipelines on that promise — so the read loops until the slice is full or the
+ * file ends, whatever the filesystem returned on the first try.
+ */
 export async function readShare(
 	share: ShareRecord,
-	payload: Record<string, unknown>
-): Promise<VfsReadReply> {
+	payload: Record<string, unknown>,
+	maxLength = VFS_CHUNK
+): Promise<VfsReadChunk> {
 	const remote = requireString(payload.path, 'path');
 	const offset = Math.max(0, Math.floor(requireNumber(payload.offset, 'offset')));
 	const wanted = Math.max(1, Math.floor(requireNumber(payload.length, 'length')));
@@ -98,17 +113,22 @@ export async function readShare(
 
 	const size = stats.size;
 	if (size === 0 || offset >= size) {
-		return { data: '', size, done: true };
+		return { bytes: Buffer.alloc(0), size, done: true };
 	}
-	const length = Math.min(wanted, VFS_CHUNK, size - offset);
+	const length = Math.min(wanted, maxLength, size - offset);
 	const handle = await open(abs, 'r');
 	try {
 		const buffer = Buffer.alloc(length);
-		const { bytesRead } = await handle.read(buffer, 0, length, offset);
+		let filled = 0;
+		while (filled < length) {
+			const { bytesRead } = await handle.read(buffer, filled, length - filled, offset + filled);
+			if (bytesRead === 0) break;
+			filled += bytesRead;
+		}
 		return {
-			data: toBase64(buffer.subarray(0, bytesRead)),
+			bytes: buffer.subarray(0, filled),
 			size,
-			done: offset + bytesRead >= size
+			done: offset + filled >= size
 		};
 	} finally {
 		await handle.close();
